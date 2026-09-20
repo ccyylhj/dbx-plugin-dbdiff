@@ -15,6 +15,10 @@
 # `macos-15` is Apple Silicon, `macos-15-intel` is Intel. Both labels move as
 # GitHub retires runner images; if a build starts failing on "no such runner",
 # check GitHub's current list.
+#
+# A tag does two things: builds the packages (artifacts, for the run) and
+# attaches them to a Release (a URL you can hand to someone). A manual run only
+# produces artifacts -- there is no tag to release under.
 
 name: build
 
@@ -81,3 +85,63 @@ jobs:
           path: dbx-plugin-dbdiff/dist/*.dbxp
           if-no-files-found: error
           retention-days: 30
+
+  # Artifacts are a build detail: at the bottom of a run page, gone after 30
+  # days, and behind a GitHub login even on a public repository. A release is a
+  # URL you can send to someone who just needs to install the thing.
+  #
+  # `gh` rather than a third-party release action -- the runners ship it, and a
+  # release helper is an odd thing to take on trust.
+  publish:
+    name: Publish release
+    # Only on a tag. A manual run has no tag to release under.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # `merge-multiple` flattens all three into one directory. The file names
+      # carry the target, so they cannot collide.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dbxp-*
+          path: packages
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so `gh` cannot infer the repository from a
+          # git remote -- it is told, along with the tag.
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat > notes.md <<'EOF'
+          Unsigned development packages.
+
+          一个平台一个包：.dbxp 里的 sidecar 是按某一个 target 编的，manifest 的
+          executable 指向那个 target 的二进制，DBX 按字面路径解析。
+
+          | 文件 | 平台 |
+          | --- | --- |
+          | `...-windows-x64.dbxp` | Windows x64 |
+          | `...-darwin-arm64.dbxp` | macOS（Apple Silicon） |
+          | `...-darwin-x64.dbxp` | macOS（Intel） |
+
+          安装：DBX 插件中心 → 第三方与开发者选项 → 打开「允许安装未签名开发包」→
+          安装对应平台的 .dbxp。
+
+          装错平台的包**安装时不会被拒**（宿主只检查 manifest 指的文件在不在），
+          启动 sidecar 时才会失败。
+
+          用法见 README.md，设计与已知风险见 PLAN.md。
+          EOF
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # Re-running a tag (or adding a target to the matrix later) should
+            # replace the files, not fail on the ones already there.
+            gh release upload "$TAG" --repo "$REPO" packages/*.dbxp --clobber
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "$TAG" --notes-file notes.md packages/*.dbxp
+          fi
