@@ -1,0 +1,7 @@
+# `eol=lf` rather than plain `text=auto`: this is checked out on Windows and
+# built on Windows, macOS and Linux runners from the same commit, and the
+# Windows-side `core.autocrlf=true` would otherwise leave CRLF in the working
+# tree. Pinning LF in both the repository and the working tree keeps every
+# checkout byte-identical, which is one less thing that can only break on a
+# machine nobody here has.
+* text=auto eol=lf

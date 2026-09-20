@@ -1,0 +1,13 @@
+# Build output. The .dbxp is produced by `python build.py`, and CI produces its
+# own -- nothing here is a source file.
+/build/
+/dist/
+backend/target/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Scratch files from editing sessions
+*.tmp.py
+*.tmp.txt

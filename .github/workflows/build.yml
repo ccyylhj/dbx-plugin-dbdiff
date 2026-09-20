@@ -1,0 +1,83 @@
+# Build the plugin once per platform.
+#
+# A .dbxp carries the sidecar binary for exactly one target and a manifest that
+# names it, so there is no single package that runs on both Windows and macOS --
+# `dbx.demo.dbdiff-<version>-<target>.dbxp` is one artifact per platform, and
+# they have to be built on that platform. A native sidecar links against its
+# platform's libc; cross-compiling to macOS needs Apple's SDK, whose licence
+# ties it to Apple hardware. A macOS runner *is* Apple hardware, which is the
+# whole reason this runs here rather than on a developer's Windows box.
+#
+# So: one matrix entry per target, each on a runner of that target, each running
+# `build.py` with no `--target` juggling -- on every runner the matrix target is
+# the host's own, which is what `build.py` detects and expects.
+#
+# `macos-15` is Apple Silicon, `macos-15-intel` is Intel. Both labels move as
+# GitHub retires runner images; if a build starts failing on "no such runner",
+# check GitHub's current list.
+
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  # So a package can be produced without tagging anything.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing should not cancel the others -- a macOS problem
+      # must not cost you the Windows package.
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-2022,   target: windows-x64,  python: python  }
+          - { runner: macos-15,       target: darwin-arm64, python: python3 }
+          - { runner: macos-15-intel, target: darwin-x64,   python: python3 }
+
+    steps:
+      # The plugin and the SDK are separate repositories. They are checked out as
+      # siblings because `backend/Cargo.toml` reaches the SDK at
+      # `../../dbx/plugins/sdk/rust/dbx-plugin-sdk` -- the same relative layout a
+      # developer has locally. Checking out only the plugin would leave that path
+      # pointing at nothing.
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+        with:
+          path: dbx-plugin-dbdiff
+
+      - name: Checkout DBX (the SDK lives here)
+        uses: actions/checkout@v4
+        with:
+          repository: t8y2/dbx
+          # Pinned to a commit rather than a branch: a package build should not
+          # break because upstream moved. Bump this deliberately.
+          #
+          # The SDK's own release template points at `plugin-sdk-v1`, which does
+          # not exist on the remote -- there are no `sdk`-named refs at all --
+          # so `main` was the only option, pinned by SHA.
+          ref: ea16af7f281d5b2b47cd7a22ade340b56ccb5666
+          path: dbx
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        working-directory: dbx-plugin-dbdiff
+        # `python3` is not guaranteed on the Windows runners, so the interpreter
+        # comes from the matrix rather than from a guess.
+        run: ${{ matrix.python }} build.py -t ${{ matrix.target }}
+
+      # Downloading an artifact gives you a zip *containing* the .dbxp.
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbxp-${{ matrix.target }}
+          path: dbx-plugin-dbdiff/dist/*.dbxp
+          if-no-files-found: error
+          retention-days: 30

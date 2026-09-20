@@ -1,0 +1,23 @@
+[package]
+name = "dbx-plugin-dbdiff"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+# The SDK lives in the DBX repo, not on crates.io. This is the checkout layout
+# these two repositories sit in (siblings); on another machine adjust this one
+# line and nothing else.
+dbx-plugin-sdk = { path = "../../dbx/plugins/sdk/rust/dbx-plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+fancy-regex = "0.14"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

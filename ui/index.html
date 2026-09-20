@@ -1,0 +1,912 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>库差异对比</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #ffffff;
+        --panel: #f6f7f9;
+        --panel-2: #eef0f3;
+        --border: #d8dbe0;
+        --text: #1b1f24;
+        --muted: #656d76;
+        --accent: #5b4bd6;
+        --accent-text: #ffffff;
+        --ok: #1a7f37;
+        --warn: #9a6700;
+        --error: #b42318;
+        --error-bg: #fef3f2;
+        font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1117; --panel: #161b22; --panel-2: #1c222b; --border: #30363d;
+          --text: #e6edf3; --muted: #9198a1; --accent: #7c6cf0;
+          --ok: #3fb950; --warn: #d29922; --error: #ff9c94; --error-bg: #2d1214;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body { background: var(--bg); color: var(--text); font-size: 13px; }
+      button, input, select {
+        font: inherit; color: inherit; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 7px;
+      }
+      button { padding: 6px 12px; cursor: pointer; font-weight: 600; white-space: nowrap; }
+      button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+      button.ghost { background: transparent; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      input, select { padding: 5px 9px; }
+      input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+      header {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
+      }
+      .meta { color: var(--muted); font-size: 11px; }
+      .meta code { font-family: ui-monospace, monospace; }
+      .grow { flex: 1; min-width: 0; }
+
+      main { display: grid; grid-template-columns: minmax(430px, 560px) minmax(320px, 1fr); gap: 14px; padding: 14px; height: calc(100% - 54px); overflow: hidden; }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; height: auto; overflow: auto; } }
+      .col { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+      .card { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 12px; display: flex; flex-direction: column; gap: 9px; min-height: 0; }
+      /* One typeface for the whole heading. The body stack leads with Inter,
+         which has no CJK glyphs -- so a heading like "对比条件(sql过滤)" rendered
+         its Chinese from the system CJK fallback and its latin from Inter, i.e.
+         two faces in one line. Leading with a CJK face fixes that.
+         `text-transform: uppercase` is gone too: these headings are all Chinese
+         now, and the rule only served to silently rewrite `sql` to `SQL`. */
+      .card h2 {
+        margin: 0; font-size: 12px; letter-spacing: 0.07em; color: var(--muted); font-weight: 700;
+        font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", Inter, ui-sans-serif, system-ui, sans-serif;
+      }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      label.field { display: flex; flex-direction: column; gap: 4px; }
+      label.field > span { color: var(--muted); font-size: 11px; }
+      /* The one label that names a section rather than annotating a control, so
+         it reads at body weight instead of hint weight. */
+      label.field > span.filter-title { color: var(--muted); font-size: 13.5px; font-weight: 700; }
+      label.field > small { color: var(--muted); font-size: 11px; }
+      .tables { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+      .tables .tbl { padding: 5px 9px; border-bottom: 1px solid var(--border); }
+      .tables .tbl:last-child { border-bottom: none; }
+      .tables .head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 3px; }
+      .tables .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                      font-family: ui-monospace, monospace; font-size: 11.5px; }
+      .tables .cols { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
+      .tables input { display: block; width: 100%; padding: 3px 8px; font-family: ui-monospace, monospace; font-size: 11.5px; }
+
+      .status { font-size: 12px; color: var(--muted); min-height: 16px; overflow-wrap: anywhere; }
+      .status.error { color: var(--error); }
+      .status.ok { color: var(--ok); }
+      .progress { height: 5px; border-radius: 99px; background: var(--panel-2); overflow: hidden; }
+      .progress > i { display: block; height: 100%; background: var(--accent); transition: width 0.2s; }
+
+      .scroll { overflow: auto; min-height: 0; }
+      .snapshot { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 7px 10px; display: flex; align-items: center; gap: 8px; }
+      .snapshot .id { font-family: ui-monospace, monospace; font-weight: 700; }
+      .snapshot .sub { color: var(--muted); font-size: 11px; }
+      .empty { color: var(--muted); font-size: 12px; padding: 10px; text-align: center; }
+
+      #report { flex: 1 1 auto; min-height: 0; overflow: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+      #report h1 { font-size: 17px; margin: 0 0 10px; }
+      #report h2 { font-size: 13px; margin: 18px 0 8px; text-transform: none; letter-spacing: 0; color: var(--text); }
+      #report ul { margin: 6px 0; padding-left: 18px; }
+      #report li { margin: 2px 0; }
+      #report p { margin: 6px 0; color: var(--muted); }
+      #report table { border-collapse: collapse; font-size: 12px; margin: 6px 0; }
+      #report th, #report td { border: 1px solid var(--border); padding: 3px 9px; text-align: right; }
+      #report th:first-child, #report td:first-child { text-align: left; }
+      #report th { background: var(--panel); font-weight: 600; }
+      #report code { font-family: ui-monospace, monospace; background: var(--panel-2); padding: 0 3px; border-radius: 3px; }
+      #report h2.alert { color: var(--error); }
+      #report td.good { color: var(--ok); font-weight: 600; }
+      #report td.warn { color: var(--warn); font-weight: 600; }
+      #report td.bad { color: var(--error); font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <label for="connection">连接</label>
+      <select id="connection" style="min-width: 220px"><option>读取中…</option></select>
+      <label for="database">库</label>
+      <select id="database" style="min-width: 180px"><option>—</option></select>
+      <button id="refresh" class="ghost">刷新</button>
+      <div class="grow"></div>
+      <div class="meta" id="host-info"></div>
+    </header>
+
+    <main>
+      <section class="col">
+        <div class="card">
+          <h2>对比条件(SQL过滤)</h2>
+          <div class="tables" id="fixed-tables"><div class="empty">读取中…</div></div>
+
+          <label class="field">
+            <span class="filter-title">表结构过滤,正则匹配表名,例如 ^(?!test_|t_).*$</span>
+            <input id="schema-filter" class="mono" placeholder="过滤条件" />
+          </label>
+
+          <div class="row">
+            <button id="create" class="primary" disabled>新建快照</button>
+            <div class="grow"></div>
+            <button id="cancel" class="ghost" style="display: none">取消</button>
+          </div>
+          <div class="progress" id="progress" style="display: none"><i style="width: 0%"></i></div>
+          <div class="row" style="align-items: flex-start; flex-wrap: nowrap">
+            <div class="status grow" id="status"></div>
+            <button id="clear-status" class="ghost" style="padding: 1px 8px; font-size: 11px" disabled>清除</button>
+          </div>
+        </div>
+
+        <div class="card" style="flex: 1 1 auto">
+          <div class="row">
+            <h2 style="flex: 1">历史快照</h2>
+            <button id="reload-snapshots" class="ghost">刷新</button>
+          </div>
+          <div id="snapshot-list" class="scroll" style="display: flex; flex-direction: column; gap: 6px">
+            <div class="empty">还没有快照</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="col">
+        <div class="card" style="flex: 1 1 auto">
+          <div class="row">
+            <h2 style="flex: 1">对比结果</h2>
+            <button id="reveal" class="ghost" disabled>打开 SQL 生成位置</button>
+            <button id="copy-path" class="ghost" disabled>复制路径</button>
+          </div>
+          <div id="report"><div class="empty">选一份快照，点「对比」</div></div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const $ = (selector) => document.querySelector(selector);
+      const connectionSelect = $("#connection");
+      const databaseSelect = $("#database");
+      const snapshotList = $("#snapshot-list");
+      const reportBox = $("#report");
+      const progressBar = $("#progress");
+
+      /**
+       * The one status message that reports a condition rather than an event
+       * ("this connection has no default database"). It has to come down by
+       * itself once the condition stops holding, which is why it is tracked by
+       * text: clearing it can then never wipe a real error that landed in the
+       * meantime.
+       */
+      let transientStatus = "";
+
+      const state = {
+        connections: [], databases: [], outputDir: "",
+        snapshots: [], tables: [], savedFilters: {}, schemaFilter: "",
+      };
+      let busy = false;
+
+      /**
+       * Disable every control except the cancel button while a job runs. Each
+       * element's own idle state is captured first and restored afterwards --
+       * "disabled" is not one state here, it depends on whether connections
+       * loaded, whether a report exists, whether a snapshot has schema data.
+       * States that change *during* a job are re-applied explicitly below.
+       */
+      /** Set a control's own idle state, honouring an in-flight job. Controls
+       *  built while a job runs (snapshot rows are rebuilt mid-job) must not come
+       *  back enabled. */
+      function setIdle(element, disabled) {
+        if (busy) {
+          element.dataset.idleDisabled = disabled ? "1" : "0";
+          element.disabled = true;
+        } else {
+          element.disabled = disabled;
+        }
+      }
+
+      function setBusy(value) {
+        busy = value;
+        for (const element of document.querySelectorAll("button, input, select")) {
+          if (element.id === "cancel") continue;
+          if (value) {
+            if (element.dataset.idleDisabled === undefined) {
+              element.dataset.idleDisabled = element.disabled ? "1" : "0";
+            }
+            element.disabled = true;
+          } else if (element.dataset.idleDisabled !== undefined) {
+            element.disabled = element.dataset.idleDisabled === "1";
+            delete element.dataset.idleDisabled;
+          }
+        }
+        if (!value) {
+          connectionSelect.disabled = state.connections.length === 0;
+          // Deliberately not tied to whether a database is picked: the button
+          // stays live so clicking it can say what is missing. A dead button
+          // gives no reason.
+          databaseSelect.disabled = databaseSelect.options.length === 0;
+          $("#create").disabled = connectionSelect.disabled;
+          refreshClearButton();
+          $("#reveal").disabled = !state.outputDir;
+          $("#copy-path").disabled = !state.outputDir;
+          $("#cancel").disabled = false;
+        }
+      }
+
+      function currentFilters() {
+        const filters = {};
+        for (const input of document.querySelectorAll("#fixed-tables input[data-table]")) {
+          const value = input.value.trim();
+          if (value) filters[input.dataset.table] = value;
+        }
+        return filters;
+      }
+
+      let saveTimer = null;
+      function scheduleSave() {
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(saveConfig, 600);
+      }
+
+      async function saveConfig() {
+        clearTimeout(saveTimer);
+        state.savedFilters = currentFilters();
+        state.schemaFilter = $("#schema-filter").value.trim();
+        try {
+          await call("config/save", {
+            config: { outputDir: "", filters: state.savedFilters, schemaFilter: state.schemaFilter },
+          }, 20000);
+          return true;
+        } catch (error) {
+          setStatus(`过滤条件没保存成功：${error.message}`, "error");
+          return false;
+        }
+      }
+
+      function setStatus(text, tone = "") {
+        const node = $("#status");
+        node.textContent = text;
+        node.className = `status ${tone}`;
+        refreshClearButton();
+      }
+
+      function setTransientStatus(text) {
+        transientStatus = text;
+        setStatus(text);
+      }
+
+      function clearTransientStatus() {
+        if (transientStatus && $("#status").textContent === transientStatus) setStatus("");
+        transientStatus = "";
+      }
+
+      /** Enabled only when there is something to clear, and never mid-job --
+       *  the status line is the job's progress readout then, and wiping it would
+       *  leave the panel looking stalled. */
+      function refreshClearButton() {
+        $("#clear-status").disabled = busy || !$("#status").textContent.trim();
+      }
+
+      function escapeHtml(text) {
+        return String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+      }
+
+      function call(method, params, timeoutMs = 120000) {
+        return window.dbxPlugin.invoke(method, params, { timeoutMs });
+      }
+
+      // ---------------------------------------------------------- fixed scope
+
+      async function loadConfig() {
+        try {
+          const payload = await call("config/get", {}, 20000);
+          state.savedFilters = payload.config.filters || {};
+          state.schemaFilter = payload.config.schemaFilter || "";
+          $("#schema-filter").value = state.schemaFilter;
+        } catch (error) {
+          setStatus(`读取配置失败：${error.message}`, "error");
+        }
+      }
+
+      async function loadHostInfo() {
+        try {
+          const info = await call("host/info", {});
+          state.outputDir = info.outputDir;
+          $("#host-info").innerHTML = `SQL 输出 <code>${escapeHtml(info.outputDir)}</code>`;
+
+          const box = $("#fixed-tables");
+          box.innerHTML = "";
+          state.tables = info.tables;
+          const saved = state.savedFilters || {};
+          for (const table of info.tables) {
+            const block = document.createElement("div");
+            block.className = "tbl";
+
+            const head = document.createElement("div");
+            head.className = "head";
+            const name = document.createElement("span");
+            name.className = "name";
+            name.textContent = table.table;
+            name.title = table.columns.join(", ");
+            const columns = document.createElement("span");
+            columns.className = "cols";
+            columns.textContent = `${table.columns.length} 列`;
+            head.append(name, columns);
+
+            const input = document.createElement("input");
+            input.className = "mono";
+            input.placeholder = "过滤条件";
+            input.value = saved[table.table] || "";
+            input.dataset.table = table.table;
+            input.addEventListener("input", scheduleSave);
+
+            block.append(head, input);
+            box.append(block);
+          }
+        } catch (error) {
+          $("#host-info").textContent = String(error.message || error);
+        }
+      }
+
+      // ------------------------------------------------------------ snapshots
+
+      async function loadConnections() {
+        connectionSelect.disabled = true;
+        try {
+          const payload = await call("connections/list", {});
+          state.connections = payload.connections || [];
+          connectionSelect.innerHTML = "";
+          for (const connection of state.connections) {
+            const option = document.createElement("option");
+            option.value = connection.name;
+            option.textContent = `${connection.name} · ${connection.type}`;
+            connectionSelect.appendChild(option);
+          }
+          connectionSelect.disabled = state.connections.length === 0;
+          $("#create").disabled = connectionSelect.disabled;
+          await loadDatabases();
+        } catch (error) {
+          connectionSelect.innerHTML = "<option>读取失败</option>";
+          setStatus(`读取连接失败：${error.message}`, "error");
+        }
+      }
+
+      /**
+       * Fill the database picker for the current connection.
+       *
+       * The default is the connection's own configured database, which the CLI
+       * already reports -- no query needed to find it. A MySQL connection made
+       * without a database has none, and then the picker starts on an empty
+       * entry and the user has to choose: the plugin cannot guess, and guessing
+       * wrong would snapshot a different database than the one meant.
+       */
+      async function loadDatabases() {
+        const connection = connectionSelect.value;
+        const configured = (state.connections.find((item) => item.name === connection) || {}).database || "";
+        databaseSelect.disabled = true;
+        state.databases = [];
+
+        if (!connection) {
+          databaseSelect.innerHTML = "<option>—</option>";
+          return;
+        }
+        let failed = false;
+        try {
+          const payload = await call("databases/list", { connection }, 30000);
+          state.databases = payload.databases || [];
+        } catch (error) {
+          // Carries on rather than emptying the picker: an unreachable server
+          // still has a configured database, and that is still the right
+          // default. The error is reported, not swallowed.
+          failed = true;
+          setStatus(`读取数据库列表失败：${error.message}`, "error");
+        }
+
+        const names = state.databases.slice();
+        // A configured database that is missing from the list (no SHOW rights,
+        // or the schema was dropped) is still offered -- it is what the
+        // connection points at, and hiding it would silently change the target.
+        if (configured && !names.includes(configured)) names.unshift(configured);
+
+        databaseSelect.innerHTML = "";
+        if (!configured) databaseSelect.append(new Option("请选择数据库", ""));
+        for (const name of names) databaseSelect.append(new Option(name, name));
+        databaseSelect.value = names.includes(configured) ? configured : "";
+        databaseSelect.disabled = names.length === 0;
+
+        // The hint lives and dies with the condition it describes, so every
+        // pass through here re-decides it -- picking a database clears it, and
+        // switching to another connection without one brings it back. A failed
+        // listing keeps its own error: that says more.
+        if (!failed) {
+          if (connection && !databaseSelect.value) {
+            setTransientStatus("这个连接没有默认数据库 —— 选一个库再开始");
+          } else {
+            clearTransientStatus();
+          }
+        }
+      }
+
+      async function loadSnapshots() {
+        const connection = connectionSelect.value;
+        const database = databaseSelect.value;
+        state.snapshots = [];
+        if (!connection) return;
+        if (!database) {
+          snapshotList.innerHTML = `<div class="empty">选一个数据库，这里显示它的快照</div>`;
+          return;
+        }
+        try {
+          const payload = await call("snapshot/list", { connection, database });
+          state.snapshots = payload.snapshots;
+          snapshotList.innerHTML = "";
+          if (payload.snapshots.length === 0) {
+            snapshotList.innerHTML = `<div class="empty">还没有快照</div>`;
+            return;
+          }
+          for (const snapshot of payload.snapshots) {
+            const row = document.createElement("div");
+            row.className = "snapshot";
+            // (buttons below go through setIdle so they stay disabled mid-job)
+
+            const id = document.createElement("span");
+            id.className = "id";
+            id.textContent = snapshot.snapshotId;
+            id.title = snapshot.takenAt;
+
+            const sub = document.createElement("span");
+            sub.className = "sub grow";
+            const rows = snapshot.dataTables.reduce((total, table) => total + table.rowCount, 0);
+            const collapsed = snapshot.dataTables.reduce((total, table) => total + (table.collapsed || 0), 0);
+            sub.textContent = [
+              `${rows} 行`,
+              snapshot.schema ? `${snapshot.schema.tableCount} 表结构` : "无结构数据",
+            ].join(" · ");
+            if (collapsed) {
+              const warn = document.createElement("span");
+              warn.style.cssText = "color:var(--error);font-weight:600;margin-left:6px;";
+              warn.textContent = `⚠ 折叠 ${collapsed} 行`;
+              sub.append(warn);
+            }
+
+            const compare = document.createElement("button");
+            compare.className = "ghost";
+            compare.textContent = "对比";
+            setIdle(compare, !snapshot.schema);
+            if (!snapshot.schema) compare.title = "这份快照没有结构数据，重新打一次";
+            compare.addEventListener("click", () => runDiff(snapshot.snapshotId));
+
+            const detail = document.createElement("button");
+            detail.className = "ghost";
+            detail.textContent = "详情";
+            setIdle(detail, false);
+            detail.addEventListener("click", () => showSnapshotDetail(snapshot.snapshotId));
+
+            const remove = document.createElement("button");
+            remove.className = "ghost";
+            remove.textContent = "删除";
+            setIdle(remove, false);
+            remove.addEventListener("click", async () => {
+              const ok = await confirmDialog(`删除快照 ${snapshot.snapshotId}？`, "快照目录会整个删除，不可恢复。");
+              if (!ok) return;
+              try {
+                await call("snapshot/delete", { connection, database, snapshotId: snapshot.snapshotId });
+                await loadSnapshots();
+              } catch (error) {
+                setStatus(String(error.message || error), "error");
+              }
+            });
+
+            row.append(id, sub, compare, detail, remove);
+            snapshotList.append(row);
+          }
+        } catch (error) {
+          snapshotList.innerHTML = `<div class="empty">读取快照失败：${escapeHtml(error.message)}</div>`;
+        }
+      }
+
+      /**
+       * Both jobs need a picked database -- it is half the snapshot's identity,
+       * so there is nothing to fall back on. Asked as a dialog rather than
+       * enforced by a disabled button, because "why is this greyed out" is a
+       * worse question than "pick a database".
+       */
+      async function requireDatabase() {
+        if (databaseSelect.value) return true;
+        const detail = connectionSelect.value
+          ? `连接「${connectionSelect.value}」上还没有选库。快照按「连接 + 库」区分，先选一个再操作。`
+          : "先选一个连接。";
+        await alertDialog("请先选择数据库", detail);
+        databaseSelect.focus();
+        return false;
+      }
+
+      async function createSnapshot() {
+        if (!(await requireDatabase())) return;
+        await saveConfig();
+        await runJob("snapshot/create", {
+          connection: connectionSelect.value,
+          database: databaseSelect.value,
+          filters: currentFilters(),
+          schemaFilter: $("#schema-filter").value.trim(),
+        });
+      }
+
+      // ----------------------------------------------------------------- jobs
+
+      async function runJob(method, params) {
+        beginProgress();
+        try {
+          await call(method, params, 30000);
+          await pollJob();
+        } catch (error) {
+          setStatus(String(error.message || error), "error");
+          resetProgress();
+        }
+      }
+
+      async function runDiff(snapshotId) {
+        if (!(await requireDatabase())) return;
+        const params = {
+          connection: connectionSelect.value,
+          database: databaseSelect.value,
+          snapshotId,
+          filters: currentFilters(),
+          schemaFilter: $("#schema-filter").value.trim(),
+        };
+        await saveConfig();
+        beginProgress();
+        let first;
+        try {
+          first = await call("diff/run", params, 30000);
+        } catch (error) {
+          setStatus(String(error.message || error), "error");
+          resetProgress();
+          return;
+        }
+        if (first && first.needsConfirm) {
+          resetProgress();
+          const lines = (first.filterDiffs || []).map(
+            (d) => `【${d.table}】
+  快照：${d.baseline || "（无）"}
+  当前：${d.current || "（无）"}`,
+          );
+          if (first.schemaFilterDiff) {
+            lines.push(
+              `【表结构过滤】
+  快照：${first.schemaFilterDiff.baseline || "（无）"}
+  当前：${first.schemaFilterDiff.current || "（无）"}`,
+            );
+          }
+          // NOTE: no window.confirm() here on purpose. The panel runs in a
+          // sandboxed iframe without allow-modals, so confirm() never shows and
+          // just returns false -- the question has to be an in-page dialog.
+          const ok = await confirmDialog(
+            "当前过滤条件与快照过滤条件不一致，是否继续？",
+            lines.join("\n"),
+          );
+          if (!ok) {
+            setStatus("已取消：过滤条件不一致，未开始对比");
+            return;
+          }
+          beginProgress();
+          try {
+            await call("diff/run", { ...params, force: true }, 30000);
+          } catch (error) {
+            setStatus(String(error.message || error), "error");
+            resetProgress();
+            return;
+          }
+        }
+        await pollJob();
+      }
+
+      function beginProgress() {
+        setBusy(true);
+        $("#create").disabled = true;
+        $("#cancel").textContent = "取消";
+        $("#cancel").disabled = false;
+        $("#cancel").style.display = "";
+        progressBar.style.display = "";
+        progressBar.querySelector("i").style.width = "0%";
+        setStatus("正在启动…");
+      }
+
+      async function showSnapshotDetail(snapshotId) {
+        try {
+          const payload = await call(
+            "snapshot/inspect",
+            { connection: connectionSelect.value, database: databaseSelect.value, snapshotId },
+            30000,
+          );
+          openModal(renderSnapshotDetail(payload.snapshot));
+        } catch (error) {
+          setStatus(String(error.message || error), "error");
+        }
+      }
+
+      function renderSnapshotDetail(snapshot) {
+        const rows = (snapshot.dataTables || []).map((table) => `
+          <tr><td><code>${escapeHtml(table.table)}</code></td>
+          <td>${table.rowCount}</td><td>${table.pages}</td>
+          <td><code>${escapeHtml((table.sha256 || "").slice(0, 12))}</code></td>
+          <td>${table.collapsed ? `⚠ 折叠 ${table.collapsed} 行` : "—"}</td></tr>
+          <tr><td></td><td colspan="4" style="text-align:left;color:var(--muted)">过滤：<code>${escapeHtml(table.filter || "（无）")}</code></td></tr>
+        `).join("");
+        const schema = snapshot.schema
+          ? `${snapshot.schema.tableCount} 张表 / ${snapshot.schema.objectCount} 个对象`
+          : "无（旧快照）";
+        return `
+          <h2>快照 ${escapeHtml(snapshot.snapshotId)}</h2>
+          <ul>
+            <li>连接 <code>${escapeHtml(snapshot.connection)}</code> · 库 <code>${escapeHtml(snapshot.database)}</code></li>
+            <li>采集于 ${escapeHtml(snapshot.takenAt)} · 插件 v${escapeHtml(snapshot.pluginVersion)} · hash v${escapeHtml(String(snapshot.hashAlgoVersion))}</li>
+            <li>结构：${escapeHtml(schema)} · 表结构过滤：<code>${escapeHtml(snapshot.schemaFilter || "（无）")}</code></li>
+          </ul>
+          <table><thead><tr><th>表</th><th>行数</th><th>页数</th><th>sha256</th><th>折叠</th></tr></thead>
+          <tbody>${rows}</tbody></table>`;
+      }
+
+      function openModal(html) {
+        closeModal();
+        const overlay = document.createElement("div");
+        overlay.id = "modal-overlay";
+        overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:50;";
+        const box = document.createElement("div");
+        box.style.cssText = "background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:16px;max-width:min(720px,92vw);max-height:84vh;overflow:auto;";
+        box.innerHTML = html;
+        const close = document.createElement("div");
+        close.className = "row";
+        close.style.justifyContent = "flex-end";
+        const button = document.createElement("button");
+        button.textContent = "关闭";
+        button.addEventListener("click", closeModal);
+        close.append(button);
+        box.append(close);
+        overlay.addEventListener("click", (event) => { if (event.target === overlay) closeModal(); });
+        overlay.append(box);
+        document.body.append(overlay);
+      }
+
+      /** The shell every dialog below is built from. All of them have to be
+       *  drawn in the page: the panel runs in a sandboxed iframe with no
+       *  `allow-modals`, so `window.confirm()` / `alert()` never show and just
+       *  return false. */
+      function dialogShell(title, body) {
+        closeModal();
+        const overlay = document.createElement("div");
+        overlay.id = "modal-overlay";
+        overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:50;";
+        const box = document.createElement("div");
+        box.style.cssText = "background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:16px;max-width:min(680px,92vw);max-height:84vh;overflow:auto;";
+        const heading = document.createElement("h2");
+        heading.textContent = title;
+        const content = document.createElement("pre");
+        content.style.cssText = "white-space:pre-wrap;font:inherit;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px;";
+        content.textContent = body;
+        const actions = document.createElement("div");
+        actions.className = "row";
+        actions.style.justifyContent = "flex-end";
+        box.append(heading, content, actions);
+        overlay.append(box);
+        document.body.append(overlay);
+        return { overlay, actions };
+      }
+
+      /** A confirm() that works inside the sandbox: resolves true/false. */
+      function confirmDialog(title, body) {
+        return new Promise((resolve) => {
+          const { overlay, actions } = dialogShell(title, body);
+          const cancel = document.createElement("button");
+          cancel.className = "ghost";
+          cancel.textContent = "取消";
+          const go = document.createElement("button");
+          go.className = "primary";
+          go.textContent = "继续";
+          cancel.addEventListener("click", () => { closeModal(); resolve(false); });
+          go.addEventListener("click", () => { closeModal(); resolve(true); });
+          overlay.addEventListener("click", (event) => {
+            if (event.target === overlay) { closeModal(); resolve(false); }
+          });
+          actions.append(cancel, go);
+          go.focus();
+        });
+      }
+
+      /** A one-button prompt. "You have not picked a database" is not a
+       *  question, so it must not be dressed up as one. */
+      function alertDialog(title, body) {
+        return new Promise((resolve) => {
+          const { overlay, actions } = dialogShell(title, body);
+          const ok = document.createElement("button");
+          ok.className = "primary";
+          ok.textContent = "知道了";
+          ok.addEventListener("click", () => { closeModal(); resolve(); });
+          overlay.addEventListener("click", (event) => {
+            if (event.target === overlay) { closeModal(); resolve(); }
+          });
+          actions.append(ok);
+          ok.focus();
+        });
+      }
+
+      function closeModal() {
+        document.querySelector("#modal-overlay")?.remove();
+      }
+
+      async function pollJob() {
+        for (;;) {
+          const job = await call("snapshot/status", {}, 20000);
+          if (job.phase !== "running") {
+            if (job.phase === "done" && job.kind === "diff") {
+              renderReport(job.result);
+              const t = job.result;
+              setStatus(
+                `对比完成：数据 新增 ${t.totalInserts} · 修改 ${t.totalUpdates} · 删除 ${t.totalDeletes}；` +
+                `结构 自动 ${t.autoStatements} 条 · 人工 ${t.reviewStatements} 条` +
+                (t.collapsed ? ` · ⚠ ${t.collapsed} 行标识重复被折叠` : ""),
+                "ok",
+              );
+              await loadSnapshots();
+            } else if (job.phase === "done") {
+              setStatus(`快照 ${job.snapshotId} 完成`, "ok");
+              await loadSnapshots();
+            } else if (job.phase === "cancelled") {
+              setStatus("已取消（未完成的目录已清理）");
+            } else {
+              setStatus(job.error || "失败", "error");
+            }
+            resetProgress();
+            return;
+          }
+          const total = job.tablesTotal || 1;
+          progressBar.querySelector("i").style.width = `${Math.round((job.tablesDone / total) * 100)}%`;
+          setStatus(job.detail || `${job.tablesDone}/${total}`);
+          await new Promise((resolve) => setTimeout(resolve, job.pollHintMs || 500));
+        }
+      }
+
+      function resetProgress() {
+        $("#cancel").style.display = "none";
+        $("#cancel").textContent = "取消";
+        $("#cancel").disabled = false;
+        progressBar.style.display = "none";
+        setBusy(false);
+      }
+
+      // --------------------------------------------------------------- report
+
+      function renderReport(result) {
+        state.outputDir = result.outputDir;
+        $("#reveal").disabled = false;
+        $("#copy-path").disabled = false;
+        reportBox.innerHTML = markdown(result.report);
+      }
+
+      /** Enough markdown for the report this plugin writes: headings, tables,
+       *  bullets, bold, inline code. Everything is escaped before it becomes
+       *  markup. */
+      function markdown(source) {
+        const inline = (text) =>
+          escapeHtml(text)
+            .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+            .replace(/`([^`]+)`/g, "<code>$1</code>");
+        const lines = String(source).split("\n");
+        const out = [];
+        let index = 0;
+        while (index < lines.length) {
+          const line = lines[index];
+          if (/^\|/.test(line)) {
+            const rows = [];
+            while (index < lines.length && /^\|/.test(lines[index])) {
+              const cells = lines[index].split("|").slice(1, -1).map((cell) => cell.trim());
+              // Alignment row: `---`, `---:`, `:--:`. The trailing colon is why
+              // `/^-{2,}$/` missed it -- the row then rendered as a blank first
+              // row of data.
+              if (!cells.every((cell) => /^:?-{2,}:?$/.test(cell))) rows.push(cells);
+              index += 1;
+            }
+            if (rows.length) {
+              const header = rows[0];
+              // Non-zero counts are the ones worth looking at, so colour them by
+              // column: additions green, changes amber, deletions red.
+              const tone = header.map(
+                (name) => ({ "新增": "good", "修改": "warn", "删除": "bad" })[name.replace(/[\s`*]/g, "")] || "",
+              );
+              const head = header.map((cell) => `<th>${inline(cell)}</th>`).join("");
+              const body = rows
+                .slice(1)
+                .map((row) => {
+                  const cells = row.map((cell, column) => {
+                    const bare = cell.replace(/[\s`*]/g, "");
+                    const highlight = tone[column] && /^\d+$/.test(bare) && bare !== "0";
+                    return `<td${highlight ? ` class="${tone[column]}"` : ""}>${inline(cell)}</td>`;
+                  });
+                  return `<tr>${cells.join("")}</tr>`;
+                })
+                .join("");
+              out.push(`<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`);
+            }
+            continue;
+          }
+          if (/^#{1,2}\s/.test(line)) {
+            const text = line.replace(/^#{1,2}\s/, "");
+            out.push(`<h2${text.includes("⚠") ? ' class="alert"' : ""}>${inline(text)}</h2>`);
+          } else if (/^-\s/.test(line)) {
+            const items = [];
+            while (index < lines.length && /^-\s/.test(lines[index])) {
+              items.push(`<li>${inline(lines[index].replace(/^-\s/, ""))}</li>`);
+              index += 1;
+            }
+            out.push(`<ul>${items.join("")}</ul>`);
+            continue;
+          } else if (/^\d+\.\s/.test(line)) {
+            const items = [];
+            while (index < lines.length && /^\d+\.\s/.test(lines[index])) {
+              items.push(`<li>${inline(lines[index].replace(/^\d+\.\s/, ""))}</li>`);
+              index += 1;
+            }
+            out.push(`<ul>${items.join("")}</ul>`);
+            continue;
+          } else if (line.trim()) {
+            out.push(`<p>${inline(line)}</p>`);
+          }
+          index += 1;
+        }
+        return out.join("");
+      }
+
+      // -------------------------------------------------------------- wiring
+
+      $("#refresh").addEventListener("click", () => loadConnections().then(loadSnapshots));
+      // The connection decides which databases are on offer, so it loads first;
+      // the snapshot list then follows the pair that is actually selected.
+      connectionSelect.addEventListener("change", async () => {
+        await loadDatabases();
+        await loadSnapshots();
+      });
+      databaseSelect.addEventListener("change", () => {
+        clearTransientStatus();
+        loadSnapshots();
+      });
+      $("#create").addEventListener("click", createSnapshot);
+      $("#cancel").addEventListener("click", async () => {
+        const button = $("#cancel");
+        if (button.disabled) return;
+        // The sidecar kills the in-flight `dbx` process, so this is quick -- but
+        // say so, because a silent button reads as a hang.
+        button.disabled = true;
+        button.textContent = "取消中…";
+        setStatus("正在取消，终止当前查询…");
+        try {
+          await call("snapshot/cancel", {}, 20000);
+        } catch (error) {
+          setStatus(String(error.message || error), "error");
+        }
+      });
+      $("#clear-status").addEventListener("click", () => {
+        transientStatus = "";
+        setStatus("");
+      });
+      $("#reload-snapshots").addEventListener("click", loadSnapshots);
+      $("#schema-filter").addEventListener("input", scheduleSave);
+      $("#reveal").addEventListener("click", async () => {
+        try {
+          await call("diff/reveal", { path: state.outputDir }, 20000);
+        } catch (error) {
+          setStatus(String(error.message || error), "error");
+        }
+      });
+      $("#copy-path").addEventListener("click", () => window.dbxPlugin.copy(state.outputDir).catch(() => {}));
+
+      window.dbxPlugin.ready.then(async () => {
+        await loadConfig();
+        await Promise.all([loadHostInfo(), loadConnections()]);
+        await loadSnapshots();
+      });
+    </script>
+  </body>
+</html>

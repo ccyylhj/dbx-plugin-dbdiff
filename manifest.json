@@ -1,0 +1,44 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/plugin-sdk-v1/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "dbx.demo.dbdiff",
+  "name": "DB Diff",
+  "icon": "assets/plugin.svg",
+  "version": "0.1.0",
+  "publisher": "local",
+  "description": "Snapshot selected system tables plus the whole database schema, then diff a snapshot against the live database and export SQL for another environment.",
+  "engines": {
+    "dbx": ">=0.5.68",
+    "host_api": "^1.0"
+  },
+  "entrypoints": {
+    "backend": {
+      "executable": "bin/windows-x64/dbx-plugin-dbdiff.exe"
+    },
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    }
+  },
+  "contributions": [
+    {
+      "type": "workbench",
+      "id": "dbx.demo.dbdiff.panel",
+      "label": "DB Diff",
+      "description": "Take read-only snapshots and diff them against the live database.",
+      "icon": "assets/plugin.svg"
+    }
+  ],
+  "localizations": {
+    "zh-CN": {
+      "name": "库差异对比",
+      "description": "对选定的系统表打只读快照，与当前实时数据对比，导出给另一环境执行的 SQL。",
+      "contributions": {
+        "dbx.demo.dbdiff.panel": {
+          "label": "库差异对比",
+          "description": "打只读快照，并与实时数据库对比。"
+        }
+      }
+    }
+  }
+}
