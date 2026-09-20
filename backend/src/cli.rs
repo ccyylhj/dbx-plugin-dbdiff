@@ -6,6 +6,7 @@
 //! PLAN.md §0.1 -- the self-healing diff is what covers that).
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+
+use crate::config;
 
 /// One page is one CLI process. Chosen to match the driver's own default row
 /// cap so `--limit` and the SQL `LIMIT` agree exactly.
@@ -327,20 +330,35 @@ fn parse_json(output: &CliOutput) -> Option<Value> {
 /// Where the CLI comes from, in order:
 ///
 ///   1. `DBX_CLI_BIN` -- explicit, trusted as-is.
-///   2. The npm global layout `npm install -g @dbx-app/cli` produces.
-///   3. A `dbx.exe` / `dbx` on PATH.
+///   2. The path saved in the plugin's own config. The escape hatch for a layout
+///      none of the searches below understand.
+///   3. The npm global layout `npm install -g @dbx-app/cli` produces, under every
+///      prefix in `npm_roots`.
+///   4. A `dbx` on PATH that is a real program.
+///   5. A `dbx` on PATH that is npm's JS shim -- not runnable on its own, but it
+///      names the package directory the native binary sits in.
+///   6. On macOS and Linux, the same question put to the user's login shell.
 ///
-/// Steps 2 and 3 are in this order on purpose: the desktop app's own binary is
-/// *also* called `dbx.exe`, so a PATH hit can be the wrong program entirely --
-/// launching it boots a second DBX instead of answering a query. The npm layout
-/// is unambiguous, so it is tried first. For the same reason the PATH scan skips
-/// cargo output trees (`target/debug`, `target/release`), which is exactly where
-/// a locally built desktop binary lives.
-///
-/// The npm shims (`dbx.cmd`, `dbx.ps1`, `dbx`) are scripts and are skipped --
-/// spawning one means going through cmd.exe and re-quoting the SQL for a second
-/// parser. Only real executables are used.
+/// The npm layout comes before PATH, and a real program before a shim, on
+/// purpose: the desktop app's own binary is *also* called `dbx`, so a PATH hit
+/// can be the wrong program entirely -- launching it boots a second DBX instead
+/// of answering a query. The npm layout is unambiguous. For the same reason the
+/// PATH scan skips cargo output trees (`target/debug`, `target/release`), which
+/// is exactly where a locally built desktop binary lives.
 pub fn resolve() -> Result<PathBuf, String> {
+    // Only successes are cached. A failure has to stay retryable, because the
+    // config override is one of the inputs and the user can fix it in the panel
+    // without restarting the plugin.
+    static RESOLVED: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = RESOLVED.get() {
+        return Ok(path.clone());
+    }
+    let path = locate()?;
+    let _ = RESOLVED.set(path.clone());
+    Ok(path)
+}
+
+fn locate() -> Result<PathBuf, String> {
     if let Some(explicit) = std::env::var_os("DBX_CLI_BIN") {
         let path = PathBuf::from(&explicit);
         if path.is_file() {
@@ -349,92 +367,398 @@ pub fn resolve() -> Result<PathBuf, String> {
         return Err(format!("DBX_CLI_BIN 指向的文件不存在: {}", path.display()));
     }
 
-    for candidate in npm_cli_candidates() {
-        if candidate.is_file() {
-            return Ok(candidate);
+    let configured = config::load().cli_path;
+    if !configured.trim().is_empty() {
+        let path = PathBuf::from(configured.trim());
+        if path.is_file() {
+            return Ok(path);
         }
+        return Err(format!("配置里的 dbx CLI 路径不存在: {}", path.display()));
     }
 
-    let executable = if cfg!(windows) { "dbx.exe" } else { "dbx" };
+    let packages = platform_package_names();
+    let executable = native_name();
+    let roots = npm_roots();
+    if let Some(found) = roots.iter().find_map(|root| native_under(root, &packages, executable)) {
+        return Ok(found);
+    }
+
+    // A shim is kept rather than followed straight away: a real program further
+    // along PATH is a better answer than a shim earlier on it.
+    let mut pointers: Vec<PathBuf> = Vec::new();
     if let Some(paths) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&paths) {
             if is_cargo_output_dir(&directory) {
                 continue;
             }
             let candidate = directory.join(executable);
-            if candidate.is_file() {
+            if !candidate.is_file() {
+                continue;
+            }
+            if is_script(&candidate) {
+                pointers.push(candidate);
+            } else {
                 return Ok(candidate);
             }
         }
     }
 
-    Err(format!(
-        "找不到 dbx CLI。请先 `npm install -g @dbx-app/cli`，或设置环境变量 DBX_CLI_BIN 指向 {} 的完整路径。",
-        executable
-    ))
+    #[cfg(not(windows))]
+    {
+        if let Some(found) = shell_lookup(executable) {
+            pointers.push(found);
+        }
+    }
+
+    for pointer in &pointers {
+        if !is_script(pointer) {
+            return Ok(pointer.clone());
+        }
+        if let Some(found) = shim_node_modules(pointer)
+            .iter()
+            .find_map(|node_modules| native_under(node_modules, &packages, executable))
+        {
+            return Ok(found);
+        }
+    }
+
+    Err(not_found_message(&roots, &pointers))
 }
 
-/// `<prefix>/node_modules/@dbx-app/cli/node_modules/@dbx-app/cli-<platform>/bin/dbx`
-fn npm_cli_candidates() -> Vec<PathBuf> {
-    let platform = platform_package_names();
+/// Everything that was looked at, so a machine where this fails can be diagnosed
+/// from the message alone -- the alternative is telling a Mac user to set an
+/// environment variable that a GUI app gives them no way to set.
+fn not_found_message(roots: &[PathBuf], pointers: &[PathBuf]) -> String {
+    let mut tried: Vec<String> = roots.iter().map(|root| root.display().to_string()).collect();
+    for pointer in pointers {
+        tried.push(format!("{}（npm 脚本，推不出原生二进制）", pointer.display()));
+    }
+    if tried.is_empty() {
+        tried.push("（没有可查找的位置）".to_string());
+    }
+    let mut message =
+        String::from("找不到 dbx CLI。请确认 `npm install -g @dbx-app/cli` 装好了，或在插件面板填写 dbx CLI 的完整路径。");
+    #[cfg(not(windows))]
+    message.push_str("\n也问过登录 shell 的 `command -v dbx`。");
+    message.push_str("\n已查找：\n");
+    message.push_str(&tried.join("\n"));
+    message
+}
+
+/// The platform package's `<os>-<arch>` suffix, in the CLI's spelling:
+/// `win32-x64`, `darwin-arm64`, `linux-x64-gnu`, ...
+fn platform_package_names_for(os: &str, arch: &str) -> Vec<String> {
+    let os = match os {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    };
+    let arch = match arch {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let mut names = vec![format!("cli-{os}-{arch}")];
+    if os == "linux" {
+        // The Linux builds are published with an explicit libc suffix.
+        names.push(format!("cli-{os}-{arch}-gnu"));
+        names.push(format!("cli-{os}-{arch}-musl"));
+    }
+    if os == "darwin" {
+        // The two macOS packages are built per architecture, and which one a user
+        // installed is not necessarily the one this sidecar was built for --
+        // picking the Intel package for an Apple Silicon Mac is an easy mistake,
+        // and Node there is arm64. Either binary runs on either Mac (one of them
+        // under Rosetta), so the host's own stays first and the other follows.
+        names.push(format!("cli-{os}-{}", if arch == "arm64" { "x64" } else { "arm64" }));
+    }
+    names
+}
+
+fn platform_package_names() -> Vec<String> {
+    platform_package_names_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn native_name_for(os: &str) -> &'static str {
+    if os == "windows" {
+        "dbx.exe"
+    } else {
+        "dbx"
+    }
+}
+
+fn native_name() -> &'static str {
+    native_name_for(std::env::consts::OS)
+}
+
+/// The native binary inside one `node_modules` directory, in either shape npm can
+/// produce: nested under the CLI package (what npm itself does), or hoisted
+/// beside it (which is what a pnpm store looks like -- `@dbx-app/cli` there is a
+/// symlink into `.pnpm/...`, and its dependencies are its siblings).
+fn native_under(node_modules: &Path, packages: &[String], executable: &str) -> Option<PathBuf> {
+    for package in packages {
+        for base in [
+            node_modules.join("@dbx-app").join("cli").join("node_modules"),
+            node_modules.to_path_buf(),
+        ] {
+            let candidate = base.join("@dbx-app").join(package).join("bin").join(executable);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The npm global prefixes worth looking under, as `node_modules` directories.
+///
+/// Node gets installed a dozen ways and each puts its global packages somewhere
+/// else, so this guesses widely: a miss costs one `stat`, and the alternative is
+/// a user setting a path by hand. It does not have to be complete -- step 6 of
+/// `resolve` covers whatever it misses.
+fn npm_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     #[cfg(windows)]
     if let Some(appdata) = std::env::var_os("APPDATA") {
+        // Where `npm install -g` puts things on Windows, and the one prefix that
+        // is an absolute path rather than a guess.
         roots.push(Path::new(&appdata).join("npm").join("node_modules"));
     }
 
     #[cfg(not(windows))]
     {
         if let Some(home) = std::env::var_os("HOME") {
-            roots.push(Path::new(&home).join(".npm-global").join("lib").join("node_modules"));
-            roots.push(Path::new(&home).join(".local").join("lib").join("node_modules"));
+            let home = PathBuf::from(home);
+            // Plain prefixes, including the ones the alternative package managers
+            // default to.
+            for relative in [
+                ".npm-global/lib",
+                ".local/lib",
+                ".npm/lib",
+                ".config/yarn/global",
+                ".bun/install/global",
+            ] {
+                roots.push(home.join(relative).join("node_modules"));
+            }
+            // Version managers: a known base, an unknown version directory.
+            for (base, middle) in [
+                (".nvm/versions/node", ""),
+                (".asdf/installs/nodejs", ""),
+                (".volta/tools/image/node", ""),
+                ("Library/Application Support/fnm/node-versions", "installation"),
+                (".local/share/fnm/node-versions", "installation"),
+                // pnpm numbers its global layout the same way: global/5, ...
+                ("Library/pnpm/global", ""),
+                (".local/share/pnpm/global", ""),
+            ] {
+                roots.extend(versioned_node_modules(&home.join(base), middle));
+            }
         }
-        // `/usr/local` is Homebrew's prefix on Intel Macs; Apple Silicon uses
-        // `/opt/homebrew`, and that is the common way Node gets installed there.
-        // Missing it means a Mac user has to set DBX_CLI_BIN by hand to use the
-        // plugin at all.
-        for prefix in ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"] {
+        // Both of these move a directory the list above has already guessed at.
+        if let Some(directory) = std::env::var_os("NVM_DIR") {
+            roots.extend(versioned_node_modules(&Path::new(&directory).join("versions").join("node"), ""));
+        }
+        if let Some(directory) = std::env::var_os("PNPM_HOME") {
+            roots.extend(versioned_node_modules(&Path::new(&directory).join("global"), ""));
+        }
+        // System prefixes. `/opt/homebrew` is Homebrew on Apple Silicon,
+        // `/usr/local` is Homebrew on Intel and the nodejs.org installer,
+        // `/opt/local` is MacPorts.
+        for prefix in ["/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib", "/usr/lib"] {
             roots.push(Path::new(prefix).join("node_modules"));
         }
-    }
-
-    let mut candidates = Vec::new();
-    for root in roots {
-        for package in &platform {
-            candidates.push(
-                root.join("@dbx-app")
-                    .join("cli")
-                    .join("node_modules")
-                    .join("@dbx-app")
-                    .join(package)
-                    .join("bin")
-                    .join(if cfg!(windows) { "dbx.exe" } else { "dbx" }),
-            );
+        // `NODE_PATH` is a list of `node_modules` directories by definition.
+        if let Some(paths) = std::env::var_os("NODE_PATH") {
+            roots.extend(std::env::split_paths(&paths));
         }
     }
-    candidates
+
+    roots
 }
 
-/// The platform package's `<os>-<arch>` suffix, in the CLI's spelling:
-/// `win32-x64`, `darwin-arm64`, `linux-x64-gnu`, ...
-fn platform_package_names() -> Vec<String> {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "windows" => "win32",
-        other => other,
+/// `<base>/<version>/<middle>/lib/node_modules` for every version installed,
+/// newest first.
+///
+/// Unix only, in the compiled binary: no version manager on Windows moves the
+/// global prefix -- nvm-windows shares one, and it is the same APPDATA one npm
+/// uses whatever runtime is in play. The tests run this everywhere regardless.
+///
+/// Order matters because a CLI installed under more than one runtime works from
+/// any of them, and the one in use is the new one.
+#[cfg(any(not(windows), test))]
+fn versioned_node_modules(base: &Path, middle: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(base) else {
+        return Vec::new();
     };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        other => other,
+    let mut versions: Vec<PathBuf> =
+        entries.filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+    versions.sort_by(|left, right| version_key(right).cmp(&version_key(left)));
+    versions
+        .into_iter()
+        .map(|version| if middle.is_empty() { version } else { version.join(middle) })
+        .map(|version| version.join("lib").join("node_modules"))
+        .collect()
+}
+
+/// `v20.11.0` -> `[20, 11, 0]`. Sorting by name puts `v9` above `v20`, which is
+/// the one place the difference would show.
+#[cfg(any(not(windows), test))]
+fn version_key(path: &Path) -> Vec<u64> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.split(|c: char| !c.is_ascii_digit()).filter_map(|part| part.parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// npm's `bin` entries are scripts, not programs: `dbx` is a symlink to a `.js`
+/// file beginning with `#!`. Spawning one means going through `node`, which the
+/// child cannot find -- a process the GUI started has no shell PATH -- so a shim
+/// is never used as the CLI. It is still worth reading, because where it lives
+/// says where the package is.
+fn is_script(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
     };
-    let mut names = vec![format!("cli-{os}-{arch}")];
-    if cfg!(target_os = "linux") {
-        names.push(format!("cli-{os}-{arch}-gnu"));
-        names.push(format!("cli-{os}-{arch}-musl"));
+    let mut head = [0u8; 2];
+    file.read_exact(&mut head).is_ok() && &head == b"#!"
+}
+
+/// The `node_modules` directories a shim could have got its package from,
+/// nearest first.
+///
+/// The shim is resolved through any symlink first -- pnpm and `npm link` both
+/// install by symlink, and it is the link target that names the real tree -- and
+/// then every ancestor's `node_modules` is offered, because that is where a
+/// hoisted dependency lands.
+fn shim_node_modules(shim: &Path) -> Vec<PathBuf> {
+    let Some(resolved) = fs::canonicalize(shim).ok() else {
+        return Vec::new();
+    };
+    // `<package>/bin/<file>` -> `<package>`
+    let Some(package) = resolved.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let mut roots = vec![package.join("node_modules")];
+    // Bounded: a package directory is never deep, and an unbounded walk would end
+    // up offering the filesystem root's `node_modules`.
+    let mut ancestor = package.parent();
+    for _ in 0..6 {
+        let Some(current) = ancestor else {
+            break;
+        };
+        roots.push(current.join("node_modules"));
+        ancestor = current.parent();
     }
-    names
+    roots
+}
+
+/// How long the login-shell probe is allowed to take. A shell slower than this is
+/// stuck on something in an rc file, and finding the CLI is not worth waiting.
+#[cfg(not(windows))]
+const SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(not(windows))]
+static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The `dbx` the user's own login shell would run.
+///
+/// A process the desktop app started does not inherit the PATH a terminal has --
+/// launchd hands it a minimal one -- and on macOS the usual way to get Node is a
+/// version manager whose setup lives in a shell profile. So a machine where `dbx`
+/// works perfectly in a terminal can look like a machine with no CLI at all from
+/// in here. DBX itself resolves `node` the same way for its own MCP setup.
+///
+/// Last resort, and probed once per process -- including when it finds nothing,
+/// so a shell that is slow to start is paid for once rather than on every query.
+#[cfg(not(windows))]
+fn shell_lookup(executable: &str) -> Option<PathBuf> {
+    // `Some(None)` means "asked, and there was nothing".
+    static CACHE: OnceLock<Mutex<Option<Option<PathBuf>>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(|| Mutex::new(None)).lock().ok()?;
+    if let Some(found) = cache.as_ref() {
+        return found.clone();
+    }
+    let found = probe_login_shell(executable);
+    *cache = Some(found.clone());
+    found
+}
+
+#[cfg(not(windows))]
+fn probe_login_shell(executable: &str) -> Option<PathBuf> {
+    // Marks our own line, so anything an rc file prints is ignored.
+    const MARKER: &str = "__dbx_cli_lookup=";
+    let script = format!("printf '{MARKER}%s\\n' \"$(command -v {executable} 2>/dev/null)\"");
+
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(default_shell);
+    let name = Path::new(&shell).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let args: Vec<String> = match name {
+        "fish" => vec!["-l".into(), "-i".into(), "-c".into(), script],
+        "sh" | "dash" => vec!["-ic".into(), script],
+        // `-i` reads the rc file and `-l` the profile: a version manager writes
+        // its setup to one or the other depending on which one it is and when it
+        // was installed.
+        _ => vec!["-ilc".into(), script],
+    };
+
+    // The shell writes to a file rather than a pipe. An rc file that leaves a
+    // background process behind would hold a pipe open, and reading it would then
+    // block past the timeout this is here to enforce.
+    let scratch = std::env::temp_dir().join(format!(
+        "dbx-cli-lookup-{}-{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let sink = fs::File::create(&scratch).ok()?;
+
+    let mut child = Command::new(&shell)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(sink))
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + SHELL_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Err(_) => {
+                let _ = child.kill();
+                break;
+            }
+        }
+    }
+
+    let output = fs::read_to_string(&scratch).unwrap_or_default();
+    let _ = fs::remove_file(&scratch);
+
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(MARKER))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        // An absolute path to a real file, or nothing. `command -v` also answers
+        // for shell functions and aliases, and prints a bare name for those.
+        .filter(|path| path.is_absolute() && path.is_file())
+}
+
+#[cfg(not(windows))]
+fn default_shell() -> String {
+    if Path::new("/bin/zsh").exists() {
+        "/bin/zsh".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
 }
 
 /// `.../target/debug` or `.../target/release` -- a cargo build tree.
@@ -448,4 +772,154 @@ fn is_cargo_output_dir(directory: &Path) -> bool {
 
 pub fn describe_cli() -> String {
     resolve().map(|path| path.display().to_string()).unwrap_or_else(|message| message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A throwaway directory tree. This crate has no dev-dependencies, so it is
+    /// built by hand; the name carries the test's own name and the process id so
+    /// two tests, or two runs, cannot collide.
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("dbx-cli-{}-{}", std::process::id(), name));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create the scratch tree");
+            Self(root)
+        }
+
+        fn file(&self, relative: &str, content: &[u8]) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().expect("a file has a parent")).expect("create the parent");
+            fs::write(&path, content).expect("write the file");
+            path
+        }
+
+        fn dir(&self, relative: &str) {
+            fs::create_dir_all(self.0.join(relative)).expect("create the directory");
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn arm64() -> Vec<String> {
+        vec!["cli-darwin-arm64".to_string()]
+    }
+
+    /// Compare after canonicalising both sides: `shim_node_modules` resolves the
+    /// shim first, and on Windows that prefixes the result with `\\?\` while the
+    /// test's own path does not have it.
+    fn assert_same_path(found: Option<PathBuf>, expected: &Path) {
+        let found = fs::canonicalize(found.expect("a binary was found")).expect("canonicalize what was found");
+        let expected = fs::canonicalize(expected).expect("canonicalize what was expected");
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn the_nested_layout_is_what_npm_produces() {
+        let tree = Tree::new("nested");
+        let expected =
+            tree.file("node_modules/@dbx-app/cli/node_modules/@dbx-app/cli-darwin-arm64/bin/dbx", b"\x7fELF");
+        assert_eq!(native_under(&tree.0.join("node_modules"), &arm64(), "dbx"), Some(expected));
+    }
+
+    #[test]
+    fn the_hoisted_layout_is_what_a_pnpm_store_has() {
+        let tree = Tree::new("hoisted");
+        let expected = tree.file("node_modules/@dbx-app/cli-darwin-arm64/bin/dbx", b"\x7fELF");
+        assert_eq!(native_under(&tree.0.join("node_modules"), &arm64(), "dbx"), Some(expected));
+    }
+
+    #[test]
+    fn only_the_platform_that_was_asked_for_is_returned() {
+        let tree = Tree::new("platform");
+        tree.file("node_modules/@dbx-app/cli-darwin-arm64/bin/dbx", b"\x7fELF");
+        let expected = tree.file("node_modules/@dbx-app/cli-darwin-x64/bin/dbx", b"\x7fELF");
+        let found = native_under(&tree.0.join("node_modules"), &["cli-darwin-x64".to_string()], "dbx");
+        assert_eq!(found, Some(expected));
+    }
+
+    #[test]
+    fn a_shim_names_the_package_the_native_binary_is_in() {
+        let tree = Tree::new("shim");
+        let expected =
+            tree.file("lib/node_modules/@dbx-app/cli/node_modules/@dbx-app/cli-darwin-arm64/bin/dbx", b"\x7fELF");
+        let shim = tree.file("lib/node_modules/@dbx-app/cli/bin/dbx.js", b"#!/usr/bin/env node\n");
+        assert!(is_script(&shim), "a `#!` file is a script, not a program");
+        let found =
+            shim_node_modules(&shim).iter().find_map(|modules| native_under(modules, &arm64(), "dbx"));
+        assert_same_path(found, &expected);
+    }
+
+    #[test]
+    fn a_shim_also_finds_a_hoisted_package_above_it() {
+        let tree = Tree::new("shim-hoisted");
+        let expected = tree.file("lib/node_modules/@dbx-app/cli-darwin-arm64/bin/dbx", b"\x7fELF");
+        let shim = tree.file("lib/node_modules/@dbx-app/cli/bin/dbx.js", b"#!/usr/bin/env node\n");
+        let found =
+            shim_node_modules(&shim).iter().find_map(|modules| native_under(modules, &arm64(), "dbx"));
+        assert_same_path(found, &expected);
+    }
+
+    #[test]
+    fn a_binary_is_not_mistaken_for_a_shim() {
+        let tree = Tree::new("binary");
+        assert!(!is_script(&tree.file("bin/dbx", b"\x7fELF\x02\x01\x01")));
+        assert!(!is_script(&tree.0.join("nothing-here")));
+    }
+
+    #[test]
+    fn platform_package_names_use_the_clis_spelling() {
+        assert_eq!(platform_package_names_for("macos", "aarch64"), vec!["cli-darwin-arm64", "cli-darwin-x64"]);
+        assert_eq!(platform_package_names_for("macos", "x86_64"), vec!["cli-darwin-x64", "cli-darwin-arm64"]);
+        assert_eq!(platform_package_names_for("windows", "x86_64"), vec!["cli-win32-x64"]);
+        assert_eq!(
+            platform_package_names_for("linux", "x86_64"),
+            vec!["cli-linux-x64", "cli-linux-x64-gnu", "cli-linux-x64-musl"]
+        );
+    }
+
+    #[test]
+    fn the_executable_is_named_per_platform() {
+        assert_eq!(native_name_for("windows"), "dbx.exe");
+        assert_eq!(native_name_for("macos"), "dbx");
+        assert_eq!(native_name_for("linux"), "dbx");
+    }
+
+    #[test]
+    fn version_directories_are_listed_newest_first() {
+        let tree = Tree::new("versions");
+        tree.dir(".nvm/versions/node/v9.11.2");
+        tree.dir(".nvm/versions/node/v20.11.0");
+        tree.dir(".nvm/versions/node/v18.20.4");
+        let found = versioned_node_modules(&tree.0.join(".nvm/versions/node"), "");
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|path| Some(path.parent()?.parent()?.file_name()?.to_str()?.to_string()))
+            .collect();
+        assert_eq!(names, vec!["v20.11.0", "v18.20.4", "v9.11.2"]);
+        assert!(found[0].ends_with("lib/node_modules"));
+        assert!(versioned_node_modules(&tree.0.join(".nvm/versions/nowhere"), "").is_empty());
+    }
+
+    #[test]
+    fn a_version_is_compared_as_numbers_not_text() {
+        assert_eq!(version_key(Path::new("v20.11.0")), vec![20, 11, 0]);
+        assert!(version_key(Path::new("v20.11.0")) > version_key(Path::new("v9.11.2")));
+    }
+
+    #[test]
+    fn a_version_manager_can_hide_the_prefix_behind_an_extra_directory() {
+        let tree = Tree::new("fnm");
+        tree.dir("node-versions/v20.11.0/installation");
+        let found = versioned_node_modules(&tree.0.join("node-versions"), "installation");
+        assert_eq!(found, vec![tree.0.join("node-versions/v20.11.0/installation/lib/node_modules")]);
+    }
 }

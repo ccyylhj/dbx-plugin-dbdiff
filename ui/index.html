@@ -80,7 +80,8 @@
       .tables .cols { flex: 0 0 auto; color: var(--muted); font-size: 11px; }
       .tables input { display: block; width: 100%; padding: 3px 8px; font-family: ui-monospace, monospace; font-size: 11.5px; }
 
-      .status { font-size: 12px; color: var(--muted); min-height: 16px; overflow-wrap: anywhere; }
+      .status { font-size: 12px; color: var(--muted); min-height: 16px; overflow-wrap: anywhere;
+                white-space: pre-wrap; }
       .status.error { color: var(--error); }
       .status.ok { color: var(--ok); }
       .progress { height: 5px; border-radius: 99px; background: var(--panel-2); overflow: hidden; }
@@ -129,6 +130,11 @@
           <label class="field">
             <span class="filter-title">表结构过滤,正则匹配表名,例如 ^(?!test_|t_).*$</span>
             <input id="schema-filter" class="mono" placeholder="过滤条件" />
+          </label>
+
+          <label class="field">
+            <span class="filter-title">dbx CLI 路径（留空自动查找）</span>
+            <input id="cli-path" class="mono" placeholder="留空自动查找" />
           </label>
 
           <div class="row">
@@ -185,7 +191,7 @@
 
       const state = {
         connections: [], databases: [], outputDir: "",
-        snapshots: [], tables: [], savedFilters: {}, schemaFilter: "",
+        snapshots: [], tables: [], savedFilters: {}, schemaFilter: "", cliPath: "",
       };
       let busy = false;
 
@@ -255,9 +261,15 @@
         clearTimeout(saveTimer);
         state.savedFilters = currentFilters();
         state.schemaFilter = $("#schema-filter").value.trim();
+        state.cliPath = $("#cli-path").value.trim();
         try {
           await call("config/save", {
-            config: { outputDir: "", filters: state.savedFilters, schemaFilter: state.schemaFilter },
+            config: {
+              outputDir: "",
+              filters: state.savedFilters,
+              schemaFilter: state.schemaFilter,
+              cliPath: state.cliPath,
+            },
           }, 20000);
           return true;
         } catch (error) {
@@ -306,6 +318,8 @@
           state.savedFilters = payload.config.filters || {};
           state.schemaFilter = payload.config.schemaFilter || "";
           $("#schema-filter").value = state.schemaFilter;
+          state.cliPath = payload.config.cliPath || "";
+          $("#cli-path").value = state.cliPath;
         } catch (error) {
           setStatus(`读取配置失败：${error.message}`, "error");
         }
@@ -315,7 +329,15 @@
         try {
           const info = await call("host/info", {});
           state.outputDir = info.outputDir;
-          $("#host-info").innerHTML = `SQL 输出 <code>${escapeHtml(info.outputDir)}</code>`;
+          // `cli` is a resolved path, or the message saying it was not found --
+          // which lists everywhere that was searched, so it is kept reachable on
+          // the tooltip rather than dumped into the header.
+          const cli = info.cli || "";
+          const found = /[\\/]/.test(cli);
+          $("#host-info").innerHTML =
+            `SQL 输出 <code>${escapeHtml(info.outputDir)}</code>` +
+            (found ? ` · CLI <code>${escapeHtml(cli)}</code>` : " · CLI 未找到");
+          $("#host-info").title = found ? cli : `找不到 dbx CLI：\n${cli}`;
 
           const box = $("#fixed-tables");
           box.innerHTML = "";
@@ -893,6 +915,13 @@
       });
       $("#reload-snapshots").addEventListener("click", loadSnapshots);
       $("#schema-filter").addEventListener("input", scheduleSave);
+      $("#cli-path").addEventListener("input", scheduleSave);
+      // Every later call spawns a fresh CLI process, so the new path takes effect
+      // by itself -- but nothing on screen would say whether it is a good one.
+      // Re-reading the connections is the cheapest way to find out.
+      $("#cli-path").addEventListener("change", async () => {
+        if (await saveConfig()) loadConnections();
+      });
       $("#reveal").addEventListener("click", async () => {
         try {
           await call("diff/reveal", { path: state.outputDir }, 20000);

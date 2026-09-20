@@ -504,6 +504,49 @@ target 上都有效"时才用。
   只在链接时因缺 macOS SDK 停下。**代码层面 Mac 侧是通的**，但 Mac 包没在真机上跑过
 - 装错平台的包安装时不会被拒（宿主只查 manifest 指的文件在不在），启动 sidecar 时才失败
 
+### 6.3 dbx CLI 在哪（macOS 上这是真问题）
+
+插件所有读库都靠 `dbx query` 子进程，所以「找到 dbx CLI」是它的启动前提。
+`cli::resolve` 按顺序试：
+
+| # | 来源 | 说明 |
+|---|---|---|
+| 1 | `DBX_CLI_BIN` | 显式指定，照用 |
+| 2 | 配置里的 `cliPath` | 下面全落空时的人工兜底 |
+| 3 | npm 全局前缀 | 见下 |
+| 4 | PATH 上的**真程序** | 跳过 `target/debug`、`target/release` |
+| 5 | PATH 上的 npm shim | 不能直接跑，但它指明了包在哪 |
+| 6 | 登录 shell 的 `command -v dbx` | 只在 mac / linux，一个进程一次，10s 超时 |
+
+**为什么 Windows 一直没事、mac 上有事。** Windows 的全局前缀是
+`%APPDATA%/npm/node_modules` —— 一个绝对路径，第 3 步就命中。mac 上 Node 多半是版本管理器
+装的（nvm / fnm / volta / asdf），全局前缀落在
+`~/.nvm/versions/node/<版本>/lib/node_modules` 这类**要列目录才知道**的地方；更要命的是
+**从 GUI 启动的进程不继承终端的 PATH**，launchd 只给一条最简 PATH —— 用户在终端里 `dbx`
+好好的，插件里就是找不到。DBX 自己给 MCP 找 `node` 用的是同一个办法
+（`src-tauri/src/commands/mcp.rs` 的 `user_shell_node_candidate`），这里跟它保持一致。
+
+第 3 步的候选前缀：`~/.npm-global`、`~/.local`、`~/.npm`、yarn 与 bun 的全局目录、
+上面那些版本管理器的全局目录（按版本号从新到旧，`v9` 不会盖过 `v20`）、
+`NVM_DIR`、`PNPM_HOME`、`NODE_PATH`，以及 `/opt/homebrew`（Apple Silicon Homebrew）、
+`/usr/local`（Intel Homebrew 与官网安装包）、`/opt/local`（MacPorts）、`/usr`。
+一个候选没命中只花一次 `stat`，所以这里宁可多猜——猜漏了有第 6 步兜着。
+
+第 5 步值得单说：npm 装出来的 `dbx` 是**软链到 `bin/dbx.js` 的脚本**，直接 spawn 要能找
+`node`，而 GUI 进程恰恰没有。所以它不能当程序用，但能当**指针**用 —— `realpath` 之后它就是
+`.../@dbx-app/cli/bin/dbx.js`，往上两级是包目录，原生二进制在
+`<包目录>/node_modules/@dbx-app/cli-<os>-<arch>/bin/dbx`（npm 的嵌套布局），
+或者在某个祖先目录的 `node_modules` 下（pnpm 的 store、以及被提升的依赖）。
+两个形状都试，`realpath` 先走 —— pnpm 和 `npm link` 都是软链装的，**链接的目标**才指对地方，
+所以 pnpm 不需要特殊处理。
+
+找不到时，报错把**查过的每一个位置**列出来。mac 上叫用户「设个环境变量」是不现实的：
+GUI 应用没有地方设。面板上那个 `cliPath` 输入框才是能用的兜底，填了就不再用自动查找，
+路径不存在直接报错而不是悄悄回退。
+
+（`testenv.py` 是同一套顺序的 Python 版：测试脚本必须驱动**插件会用的那个** CLI，
+否则测的不是插件。）
+
 ### 6.1 几处默认值
 
 | 项 | 默认 | 理由 |
@@ -513,6 +556,7 @@ target 上都有效"时才用。
 | 快照存放 | 插件数据目录（从 sidecar 的 cwd 反推 `.../<id>/versions/<ver>` → `.../plugin-data/<id>`） | 跟着 DBX 走，便携模式也不丢 |
 | 生成文件落哪 | 插件数据目录的 `output`，界面显示完整路径 + 打开 + 复制 | 不弹保存对话框，批量产出更顺 |
 | 快照保留 | 全留（体积小），界面可手动删 | 不需要自动清理 |
+| `dbx` CLI 路径 | 空 = 自动查找（§6.3） | 只有自动查找失败才需要填 |
 
 ---
 
@@ -611,5 +655,10 @@ B 侧连接（插件从不连 B）、快照自动清理、加密、压缩、
 - **字面量只有一半验证过**：写实验室把生成的语句真的执行了一遍，这证明它们语法正确、能跑通；
   但"写进去再读出来逐列相同"这个往返验证还没做。二进制列目前会被当文本引号包起来
   （这六张表里没有，所以还没暴露）。
-- **Mac 包只有编译层面的保证**。`aarch64-apple-darwin` 编得过（只差链接器），
-  但没有在真机上装过、跑过。测试脚本和打包脚本都按平台参数化了，但**从没在非 Windows 上运行过**。
+- **Mac 包只有编译层面的保证**。CI 在 Apple 的 runner 上编得出三个平台的包，但
+  **没有一个包在真机上装过、跑过**。测试脚本和打包脚本都按平台参数化了，
+  但**从没在非 Windows 上运行过**。
+- **CLI 定位在 mac 上是猜出来的**（§6.3）。第 3 步那张前缀表是在 Windows 上照着
+  Node 生态的常见布局写的，只有 `%APPDATA%` 那一条在真机上验过。第 6 步的 shell 探针是
+  照着 DBX 自己的做法写的，也没在 mac 上跑过。两条都不中时，用户会看到一张查过的位置清单，
+  以及面板上那个可以手填的路径。

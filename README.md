@@ -114,24 +114,25 @@ python build.py --list-targets       # 有哪些 target
 带原生 sidecar 的插件**不能用 `universal`**——那是给纯前端插件准备的。
 默认矩阵是 `darwin-arm64`、`darwin-x64`、`windows-x64`、`linux-x64`、`linux-arm64`。
 
-构建完的路径：`dist/dbx.demo.dbdiff-0.1.0-<target>.dbxp`。
+构建完的路径：`dist/dbx.demo.dbdiff-<版本>-<target>.dbxp`。
 
 ### Mac 上怎么出包
 
-**必须在 Mac 上编**，交叉编译不行——sidecar 要链接平台自己的 libc，
-从 Windows 编 macOS 目标需要 macOS SDK。
+**必须在 Mac 上编**，交叉编译不行：sidecar 要链接平台自己的 libc，而从 Windows 编 macOS
+目标需要 macOS SDK，Apple 的授权把 SDK 限定在 Apple 硬件上使用。所以 Mac 包由 CI 出——
+`.github/workflows/build.yml`，三个 job 各自跑在自己那个平台的 runner 上
+（`windows-2022`、`macos-15`、`macos-15-intel`），每个 runner 只编自己那个 target。
+
+推一个 `v*` 标签就会构建并把三个包挂到 Release 上：
 
 ```bash
-# 在 Mac 上，两个仓库放成兄弟目录（Cargo.toml 里的 SDK 路径是 ../../dbx/...）
-python build.py -t darwin-arm64     # 或者 darwin-x64
+git tag v0.1.1 && git push origin v0.1.1
 ```
 
-CI 也行：`dbx` 仓库里有现成的多平台工作流模板
-（`plugins/sdk/templates/github/plugin-release.yml`）。
+不想打标签也可以在 Actions 页面手动跑一次（只有 artifacts，没有 Release）。
+本机想验一遍的话，在 Mac 上直接 `python build.py -t darwin-arm64` 就行。
 
-**状态**：`aarch64-apple-darwin` 目标实测过一遍——**这个 crate 和它的全部依赖都编译通过**，
-只在最后链接那一步停下（`linker cc not found`，找不到 macOS SDK）。也就是说代码层面
-Mac 侧是通的，缺的是 SDK，不是代码。**但编出来的 Mac 包没有在真机上跑过。**
+**状态**：三个平台都能编过、链接上、打出包。**但那个 Mac 包没有在真机上装过、跑过。**
 
 ### 安装
 
@@ -140,6 +141,24 @@ Mac 侧是通的，缺的是 SDK，不是代码。**但编出来的 Mac 包没�
 
 装错平台的包**安装时不会被拒**（宿主只检查 manifest 指的那个文件在不在，包里是有的），
 但启动 sidecar 时会失败——Mach-O 内核不执行 PE 文件。
+
+### dbx CLI 在哪
+
+插件读库全靠 `dbx query` 子进程，所以第一步是找到 `dbx` 这个 CLI
+（`npm install -g @dbx-app/cli` 装的那个）。Windows 上它就在
+`%APPDATA%/npm/node_modules` 里，找到就完了；macOS 上麻烦得多，两个原因：
+
+1. Node 多半是版本管理器装的（nvm / fnm / volta / asdf），全局前缀在
+   `~/.nvm/versions/node/<版本>/lib/node_modules` 这类要列目录才知道的地方
+2. **从 GUI 启动的进程不继承终端的 PATH**——终端里 `dbx` 好好的，插件里找不到
+
+所以 `cli::resolve` 会依次试：`DBX_CLI_BIN` → 配置里的 `cliPath` → 那串 npm 前缀 →
+PATH 上的真程序 → PATH 上的 npm shim（它是 `bin/dbx.js` 的软链，不能直接跑，
+但顺着它就能推出包在哪）→ **问一次登录 shell** `command -v dbx`。
+
+都落空时报错会把**查过的每一个位置**列出来。真找不到就在面板上把 `dbx` 的完整路径
+填进「dbx CLI 路径」，它会替代自动查找。`testenv.py` 是同一套顺序的 Python 版，
+两个测试脚本用的就是插件会用的那个 CLI。
 
 ## 连接与库
 

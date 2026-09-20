@@ -4,7 +4,7 @@
   "id": "dbx.demo.dbdiff",
   "name": "DB Diff",
   "icon": "assets/plugin.svg",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "local",
   "description": "Snapshot selected system tables plus the whole database schema, then diff a snapshot against the live database and export SQL for another environment.",
   "engines": {
