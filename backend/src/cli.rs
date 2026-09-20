@@ -436,8 +436,10 @@ fn not_found_message(roots: &[PathBuf], pointers: &[PathBuf]) -> String {
     if tried.is_empty() {
         tried.push("（没有可查找的位置）".to_string());
     }
-    let mut message =
-        String::from("找不到 dbx CLI。请确认 `npm install -g @dbx-app/cli` 装好了，或在插件面板填写 dbx CLI 的完整路径。");
+    let mut message = format!(
+        "找不到 dbx CLI。请确认 `npm install -g @dbx-app/cli` 装好了；也可以在 {} 里把 \"cliPath\" 设成 dbx 的完整路径。",
+        config::config_path().display()
+    );
     #[cfg(not(windows))]
     message.push_str("\n也问过登录 shell 的 `command -v dbx`。");
     message.push_str("\n已查找：\n");

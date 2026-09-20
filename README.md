@@ -126,7 +126,7 @@ python build.py --list-targets       # 有哪些 target
 推一个 `v*` 标签就会构建并把三个包挂到 Release 上：
 
 ```bash
-git tag v0.1.1 && git push origin v0.1.1
+git tag v0.1.2 && git push origin v0.1.2
 ```
 
 不想打标签也可以在 Actions 页面手动跑一次（只有 artifacts，没有 Release）。
@@ -156,9 +156,14 @@ git tag v0.1.1 && git push origin v0.1.1
 PATH 上的真程序 → PATH 上的 npm shim（它是 `bin/dbx.js` 的软链，不能直接跑，
 但顺着它就能推出包在哪）→ **问一次登录 shell** `command -v dbx`。
 
-都落空时报错会把**查过的每一个位置**列出来。真找不到就在面板上把 `dbx` 的完整路径
-填进「dbx CLI 路径」，它会替代自动查找。`testenv.py` 是同一套顺序的 Python 版，
-两个测试脚本用的就是插件会用的那个 CLI。
+都落空时报错会把**查过的每一个位置**列出来，并给出插件配置文件的位置——在那里把
+`cliPath` 设成 `dbx` 的完整路径就会替代整套自动查找。
+
+这一项**界面上没有**：它是给"所有自动查找都落空"准备的，正常情况留空。加个输入框反而会
+让人以为需要手动填。`DBX_CLI_BIN` 环境变量优先级更高，但 GUI 启动的应用拿不到它，
+所以配置文件那一条才是实际可用的。
+
+`testenv.py` 是同一套顺序的 Python 版，两个测试脚本用的就是插件会用的那个 CLI。
 
 ## 连接与库
 

@@ -46,8 +46,6 @@
         display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
         padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
       }
-      .meta { color: var(--muted); font-size: 11px; }
-      .meta code { font-family: ui-monospace, monospace; }
       .grow { flex: 1; min-width: 0; }
 
       main { display: grid; grid-template-columns: minmax(430px, 560px) minmax(320px, 1fr); gap: 14px; padding: 14px; height: calc(100% - 54px); overflow: hidden; }
@@ -118,7 +116,6 @@
       <select id="database" style="min-width: 180px"><option>—</option></select>
       <button id="refresh" class="ghost">刷新</button>
       <div class="grow"></div>
-      <div class="meta" id="host-info"></div>
     </header>
 
     <main>
@@ -130,11 +127,6 @@
           <label class="field">
             <span class="filter-title">表结构过滤,正则匹配表名,例如 ^(?!test_|t_).*$</span>
             <input id="schema-filter" class="mono" placeholder="过滤条件" />
-          </label>
-
-          <label class="field">
-            <span class="filter-title">dbx CLI 路径（留空自动查找）</span>
-            <input id="cli-path" class="mono" placeholder="留空自动查找" />
           </label>
 
           <div class="row">
@@ -191,7 +183,7 @@
 
       const state = {
         connections: [], databases: [], outputDir: "",
-        snapshots: [], tables: [], savedFilters: {}, schemaFilter: "", cliPath: "",
+        snapshots: [], tables: [], savedFilters: {}, schemaFilter: "",
       };
       let busy = false;
 
@@ -261,15 +253,9 @@
         clearTimeout(saveTimer);
         state.savedFilters = currentFilters();
         state.schemaFilter = $("#schema-filter").value.trim();
-        state.cliPath = $("#cli-path").value.trim();
         try {
           await call("config/save", {
-            config: {
-              outputDir: "",
-              filters: state.savedFilters,
-              schemaFilter: state.schemaFilter,
-              cliPath: state.cliPath,
-            },
+            config: { outputDir: "", filters: state.savedFilters, schemaFilter: state.schemaFilter },
           }, 20000);
           return true;
         } catch (error) {
@@ -318,8 +304,6 @@
           state.savedFilters = payload.config.filters || {};
           state.schemaFilter = payload.config.schemaFilter || "";
           $("#schema-filter").value = state.schemaFilter;
-          state.cliPath = payload.config.cliPath || "";
-          $("#cli-path").value = state.cliPath;
         } catch (error) {
           setStatus(`读取配置失败：${error.message}`, "error");
         }
@@ -329,15 +313,6 @@
         try {
           const info = await call("host/info", {});
           state.outputDir = info.outputDir;
-          // `cli` is a resolved path, or the message saying it was not found --
-          // which lists everywhere that was searched, so it is kept reachable on
-          // the tooltip rather than dumped into the header.
-          const cli = info.cli || "";
-          const found = /[\\/]/.test(cli);
-          $("#host-info").innerHTML =
-            `SQL 输出 <code>${escapeHtml(info.outputDir)}</code>` +
-            (found ? ` · CLI <code>${escapeHtml(cli)}</code>` : " · CLI 未找到");
-          $("#host-info").title = found ? cli : `找不到 dbx CLI：\n${cli}`;
 
           const box = $("#fixed-tables");
           box.innerHTML = "";
@@ -369,7 +344,7 @@
             box.append(block);
           }
         } catch (error) {
-          $("#host-info").textContent = String(error.message || error);
+          setStatus(`读取插件信息失败：${error.message}`, "error");
         }
       }
 
@@ -915,13 +890,6 @@
       });
       $("#reload-snapshots").addEventListener("click", loadSnapshots);
       $("#schema-filter").addEventListener("input", scheduleSave);
-      $("#cli-path").addEventListener("input", scheduleSave);
-      // Every later call spawns a fresh CLI process, so the new path takes effect
-      // by itself -- but nothing on screen would say whether it is a good one.
-      // Re-reading the connections is the cheapest way to find out.
-      $("#cli-path").addEventListener("change", async () => {
-        if (await saveConfig()) loadConnections();
-      });
       $("#reveal").addEventListener("click", async () => {
         try {
           await call("diff/reveal", { path: state.outputDir }, 20000);

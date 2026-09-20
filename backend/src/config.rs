@@ -38,8 +38,12 @@ pub struct Config {
     pub schema_filter: String,
     /// Full path to the `dbx` CLI. Empty means "find it", which is what almost
     /// everyone wants; this exists because finding it means guessing at how Node
-    /// was installed, and a guess that misses leaves no other way in -- the plugin
-    /// runs inside the desktop app and cannot be handed an environment variable.
+    /// was installed (see `cli::resolve`), and a guess that misses would otherwise
+    /// leave no way in at all -- the plugin runs inside the desktop app, so it
+    /// cannot be handed an environment variable.
+    ///
+    /// No UI: it is set by editing this file, and only a failure message from
+    /// `cli::resolve` is ever expected to send anyone here.
     #[serde(default, alias = "cli_path")]
     pub cli_path: String,
 }
