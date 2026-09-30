@@ -126,7 +126,7 @@ python build.py --list-targets       # 有哪些 target
 推一个 `v*` 标签就会构建并把三个包挂到 Release 上：
 
 ```bash
-git tag v0.1.2 && git push origin v0.1.2
+git tag v0.1.3 && git push origin v0.1.3
 ```
 
 不想打标签也可以在 Actions 页面手动跑一次（只有 artifacts，没有 Release）。

@@ -27,7 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// CLI's own `--timeout` bounds the server-side query; this bounds the process.
 const KILL_GRACE: Duration = Duration::from_secs(30);
 /// Used by `paginate`, which runs one page per call.
-const PAGE_TIMEOUT: Duration = Duration::from_secs(180);
+const PAGE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Connection-level failures are worth retrying. Each `dbx query` opens a fresh
 /// connection, and one snapshot opens more than a dozen; a single stalled

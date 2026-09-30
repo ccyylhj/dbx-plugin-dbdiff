@@ -31,7 +31,7 @@ use crate::store::{self, SchemaMeta, SessionInfo, SnapshotMeta, TableMeta};
 use crate::dialect::{self, Dialect};
 use crate::tables::{self, ResolvedSpec};
 
-const QUERY_TIMEOUT: Duration = Duration::from_secs(180);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(600);
 const POLL_HINT_MS: u64 = 500;
 
 #[derive(Debug)]
