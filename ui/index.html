@@ -121,7 +121,11 @@
     <main>
       <section class="col">
         <div class="card">
-          <h2>对比条件(SQL过滤)</h2>
+          <div class="row">
+            <h2 style="flex: 1">对比条件(SQL过滤)</h2>
+            <button id="import-conditions" class="ghost">导入</button>
+            <button id="export-conditions" class="ghost">导出</button>
+          </div>
           <div class="tables" id="fixed-tables"><div class="empty">读取中…</div></div>
 
           <label class="field">
@@ -346,6 +350,225 @@
         } catch (error) {
           setStatus(`读取插件信息失败：${error.message}`, "error");
         }
+      }
+
+      // ------------------------------------------- conditions: import / export
+      //
+      // A condition set is the six per-table filters plus the schema regex --
+      // the whole of what tells one comparison from another. The backend
+      // already persists it, so a file is only ever a way to carry it
+      // elsewhere: another environment, another machine, a colleague. Nothing
+      // here reads the database or touches the snapshot store.
+      //
+      // Export goes through `host.saveFile`, the only exit from the sandboxed
+      // iframe that reaches a real disk -- the panel cannot start a download
+      // itself, so the host runs the native dialog. There is no host method
+      // that opens a file, so import comes in through a text box instead, with
+      // a file picker in front of it for the webviews that offer one.
+
+      const CONDITIONS_KIND = "dbx.demo.dbdiff.conditions";
+      /** Bumped only if the shape below changes incompatibly. An import that
+       *  sees a version it does not know is refused, not guessed at. */
+      const CONDITIONS_VERSION = 1;
+
+      /** The conditions as the boxes have them. Every table in `state.tables`
+       *  appears even with an empty filter: a file that omits a table cannot be
+       *  told apart from one that says "no filter" for it, and only one of those
+       *  is a description complete enough to import. */
+      function currentConditions() {
+        const filters = {};
+        for (const table of state.tables) filters[table.table] = "";
+        for (const input of document.querySelectorAll("#fixed-tables input[data-table]")) {
+          filters[input.dataset.table] = input.value.trim();
+        }
+        return { schemaFilter: $("#schema-filter").value.trim(), filters };
+      }
+
+      function sameConditions(a, b) {
+        if (a.schemaFilter !== b.schemaFilter) return false;
+        const names = new Set([...Object.keys(a.filters), ...Object.keys(b.filters)]);
+        for (const name of names) {
+          if ((a.filters[name] || "") !== (b.filters[name] || "")) return false;
+        }
+        return true;
+      }
+
+      /** Only the entries that differ, in the shape the diff precheck dialog
+       *  uses -- a confirmation that lists six unchanged tables buries the one
+       *  line being asked about. */
+      function conditionChanges(current, incoming) {
+        const known = new Set(state.tables.map((table) => table.table));
+        const lines = [];
+        for (const table of state.tables) {
+          const before = current.filters[table.table] || "";
+          const after = incoming.filters[table.table] || "";
+          if (before !== after) {
+            lines.push(`【${table.table}】\n  当前：${before || "（无）"}\n  导入：${after || "（无）"}`);
+          }
+        }
+        for (const name of Object.keys(incoming.filters)) {
+          if (known.has(name)) continue;
+          lines.push(`【${name}】\n  导入：${incoming.filters[name] || "（无）"}\n  当前表清单里没有这张表，会被忽略`);
+        }
+        if (current.schemaFilter !== incoming.schemaFilter) {
+          lines.push(
+            `【表结构过滤】\n  当前：${current.schemaFilter || "（无）"}\n  导入：${incoming.schemaFilter || "（无）"}`,
+          );
+        }
+        return lines;
+      }
+
+      /** Parse and check without touching anything. A value that passes here is
+       *  not a promise it is valid SQL -- the database decides that, and says so
+       *  when the snapshot runs. */
+      function parseConditions(text) {
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (error) {
+          return { error: `不是合法的 JSON：${error.message}` };
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          return { error: "顶层不是一个 JSON 对象" };
+        }
+        if (data.kind !== undefined && data.kind !== CONDITIONS_KIND) {
+          return { error: `不是本插件的对比条件（kind = ${JSON.stringify(data.kind)}）` };
+        }
+        if (data.version !== undefined && data.version !== CONDITIONS_VERSION) {
+          return { error: `版本不认识：${JSON.stringify(data.version)}，本插件支持 ${CONDITIONS_VERSION}` };
+        }
+        if (data.schemaFilter !== undefined && typeof data.schemaFilter !== "string") {
+          return { error: "schemaFilter 不是字符串" };
+        }
+        if (data.filters !== undefined
+            && (typeof data.filters !== "object" || data.filters === null || Array.isArray(data.filters))) {
+          return { error: "filters 不是对象" };
+        }
+        const filters = {};
+        for (const [name, value] of Object.entries(data.filters || {})) {
+          if (typeof value !== "string") return { error: `表 ${name} 的过滤条件不是字符串` };
+          filters[name] = value.trim();
+        }
+        return { conditions: { schemaFilter: (data.schemaFilter || "").trim(), filters } };
+      }
+
+      function applyConditions(conditions) {
+        for (const input of document.querySelectorAll("#fixed-tables input[data-table]")) {
+          input.value = conditions.filters[input.dataset.table] || "";
+        }
+        $("#schema-filter").value = conditions.schemaFilter;
+      }
+
+      /** The name the save dialog opens with. Only a suggestion -- the host
+       *  sanitises it again -- so it just has to be recognisable. */
+      function conditionsFileName() {
+        const database = String(databaseSelect.value || "").replace(/[^A-Za-z0-9_.-]+/g, "_").replace(/^_+|_+$/g, "");
+        return `dbdiff-conditions${database ? `-${database}` : ""}.json`;
+      }
+
+      async function exportConditions() {
+        const conditions = currentConditions();
+        const json = JSON.stringify({
+          kind: CONDITIONS_KIND,
+          version: CONDITIONS_VERSION,
+          // Recorded for whoever opens the file; import ignores both, because
+          // carrying conditions into a different environment is the point.
+          connection: connectionSelect.value || "",
+          database: databaseSelect.value || "",
+          exportedAt: new Date().toISOString(),
+          schemaFilter: conditions.schemaFilter,
+          filters: conditions.filters,
+        }, null, 2);
+        try {
+          const saved = await window.dbxPlugin.saveFile(
+            { fileName: conditionsFileName(), contentType: "application/json" },
+            new TextEncoder().encode(json),
+          );
+          // null is the user closing the dialog, which is not a failure.
+          if (!saved) return;
+          setStatus(`对比条件已导出：${saved.path}`);
+        } catch (error) {
+          // A host without a save dialog still has a clipboard, and the box on
+          // the way back in accepts exactly this text.
+          try {
+            await window.dbxPlugin.copy(json);
+            setStatus(`保存对话框不可用（${error.message || error}），已改为复制到剪贴板`, "error");
+          } catch (copyError) {
+            setStatus(`导出失败：${copyError.message || copyError}`, "error");
+          }
+        }
+      }
+
+      /** Importing is the file picker and nothing else: one click, one native
+       *  dialog. The host has no "open a file" method, so the picker is the
+       *  page's own `<input type="file">` -- which, unlike a download, a
+       *  sandboxed iframe is allowed to show.
+       *
+       *  The input is built once and reused. `change` only fires when the
+       *  selection actually changes, so its value is cleared after every use --
+       *  otherwise picking the same file twice would do nothing the second
+       *  time. */
+      let conditionsPicker = null;
+      function pickConditionsFile() {
+        if (!conditionsPicker) {
+          conditionsPicker = document.createElement("input");
+          conditionsPicker.type = "file";
+          conditionsPicker.accept = "application/json,.json";
+          conditionsPicker.style.display = "none";
+          conditionsPicker.addEventListener("change", async () => {
+            const file = conditionsPicker.files && conditionsPicker.files[0];
+            conditionsPicker.value = "";
+            if (!file) return;
+            let raw;
+            try {
+              raw = await file.text();
+            } catch (error) {
+              setStatus(`读取 ${file.name} 失败：${error.message || error}`, "error");
+              return;
+            }
+            await importConditions(file.name, raw);
+          });
+          document.body.append(conditionsPicker);
+        }
+        conditionsPicker.click();
+      }
+
+      async function importConditions(name, raw) {
+        const parsed = parseConditions(raw);
+        if (parsed.error) {
+          const detail = `不是一份能用的对比条件：${parsed.error}`;
+          setStatus(`${name} 导入失败：${parsed.error}`, "error");
+          await alertDialog(`导入失败：${name}`, detail);
+          return;
+        }
+
+        const incoming = parsed.conditions;
+        const current = currentConditions();
+        if (sameConditions(current, incoming)) {
+          setStatus(`${name} 与当前的对比条件一致，没有改动`);
+          return;
+        }
+        // Only ask when there is something to lose. Importing into an empty
+        // panel is not a decision anybody needs to be walked through.
+        const occupied = !!current.schemaFilter || Object.values(current.filters).some((value) => value);
+        if (occupied) {
+          const ok = await confirmDialog(
+            `导入 ${name} 会覆盖当前的对比条件，是否继续？`,
+            conditionChanges(current, incoming).join("\n\n"),
+          );
+          if (!ok) {
+            setStatus("已取消导入：对比条件没有改动");
+            return;
+          }
+        }
+
+        applyConditions(incoming);
+        const known = new Set(state.tables.map((table) => table.table));
+        const unknown = Object.keys(incoming.filters).filter((key) => !known.has(key));
+        const note = unknown.length ? `，忽略了 ${unknown.length} 个不在当前表清单里的项（${unknown.join("、")}）` : "";
+        // On failure `saveConfig` has already put the reason in the status line;
+        // overwriting it here would trade a specific error for a vaguer one.
+        if (await saveConfig()) setStatus(`已从 ${name} 导入对比条件${note}`, "ok");
       }
 
       // ------------------------------------------------------------ snapshots
@@ -890,6 +1113,8 @@
       });
       $("#reload-snapshots").addEventListener("click", loadSnapshots);
       $("#schema-filter").addEventListener("input", scheduleSave);
+      $("#export-conditions").addEventListener("click", exportConditions);
+      $("#import-conditions").addEventListener("click", pickConditionsFile);
       $("#reveal").addEventListener("click", async () => {
         try {
           await call("diff/reveal", { path: state.outputDir }, 20000);
