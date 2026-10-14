@@ -10,7 +10,7 @@
 //! `live` was removed here, so the target environment has it too -- that is
 //! reported, never turned into a DROP (PLAN.md §0.3).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -63,34 +63,87 @@ pub fn filter_objects(objects: &mut Vec<SchemaObject>, pattern: &str) -> Result<
     Ok(())
 }
 
-/// The database's structure. Every query is paginated for the same reason the
-/// data channel is: `dbx query` silently caps at 10000 rows otherwise.
+/// The database's structure. Table list first, then details only for the tables
+/// the schema filter keeps.
 ///
-/// Only MySQL has an implementation so far. The PostgreSQL collection is the
-/// remaining piece of the dialect work -- `information_schema` there has no
-/// `COLUMN_TYPE`, no `ENGINE` and no `STATISTICS`, so it is a separate set of
-/// queries rather than a variation on these.
-pub fn collect(connection: &str, database: &str, dialect: Dialect) -> Result<Vec<SchemaObject>, Abort> {
+/// Rationale: the filter used to be applied in memory *after* all four queries
+/// had scanned the whole schema, so 2000 excluded tables' columns / indexes /
+/// foreign keys were read, transferred and parsed only to be thrown away. On a
+/// 3000-table PostgreSQL database that was the difference between ~10 minutes
+/// and ~3 minutes. The table list itself is one cheap page; the three heavy
+/// queries each get `AND <table> IN (<kept tables>)`, in chunks of
+/// `FILTER_CHUNK` so a 1000-table keep set stays a ~20KB statement.
+///
+/// Correctness: the keep set is computed with the very same `fancy_regex`
+/// match as the old post-filter, so the result is identical -- the SQL `IN` is
+/// an exact table-name match, never a regex translation (PostgreSQL's `~` is
+/// POSIX and cannot express `(?!...)` anyway). Callers keep their
+/// `filter_objects` call as a no-op safety net.
+pub fn collect(
+    connection: &str,
+    database: &str,
+    dialect: Dialect,
+    schema_filter: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<SchemaObject>, Abort> {
     match dialect {
-        Dialect::MySql => collect_mysql(connection, database),
-        Dialect::Postgres => crate::schema_pg::collect(connection),
+        Dialect::MySql => collect_mysql(connection, database, schema_filter, is_cancelled),
+        Dialect::Postgres => crate::schema_pg::collect(connection, schema_filter, is_cancelled),
     }
 }
 
-fn collect_mysql(connection: &str, database: &str) -> Result<Vec<SchemaObject>, Abort> {
+/// Rows of one `IN (...)` shard. 500 quoted table names are ~10KB of SQL --
+/// far below any statement-size or `IN`-list concern, while keeping each shard
+/// comfortably under one `paginate` page in the common case.
+const FILTER_CHUNK: usize = 500;
+
+/// `None` when there is no pattern (keep everything, no `IN` clause).
+/// `Some(empty)` when the pattern keeps nothing -- callers skip detail queries.
+fn keep_set(table_names: &[String], pattern: &str) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(regex) = compile_filter(pattern)? else {
+        return Ok(None);
+    };
+    let mut keep = BTreeSet::new();
+    for table in table_names {
+        if regex.is_match(table).unwrap_or(false) {
+            keep.insert(table.clone());
+        }
+    }
+    Ok(Some(keep))
+}
+
+fn in_list(names: &[String]) -> String {
+    names.iter().map(|name| quote_string(name)).collect::<Vec<_>>().join(", ")
+}
+
+fn report_phase(detail: String) {
+    crate::snapshot::with_job(|job| job.detail = detail);
+}
+
+fn collect_mysql(
+    connection: &str,
+    database: &str,
+    schema_filter: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<SchemaObject>, Abort> {
     let db = quote_string(database);
     let mut objects = Vec::new();
 
+    // Phase 1: cheap table list. This is what the keep set is computed from,
+    // so the three heavy queries below only touch kept tables.
     let tables_sql = format!(
         "SELECT tb.TABLE_NAME AS table_name, tb.ENGINE AS engine, tb.TABLE_COLLATION AS table_collation \
          FROM information_schema.TABLES tb \
          WHERE tb.TABLE_SCHEMA = {db} AND tb.TABLE_TYPE = 'BASE TABLE' \
          ORDER BY tb.TABLE_NAME"
     );
-    cli::paginate(connection, &tables_sql, &mut |rows| {
+    let mut all_tables: Vec<String> = Vec::new();
+    cli::paginate(connection, &tables_sql, is_cancelled, &mut |rows| {
         for row in rows {
+            let table = text(row, "table_name");
+            all_tables.push(table.clone());
             objects.push(SchemaObject {
-                t: text(row, "table_name"),
+                t: table,
                 o: "table".to_string(),
                 n: String::new(),
                 d: json!({
@@ -102,17 +155,36 @@ fn collect_mysql(connection: &str, database: &str) -> Result<Vec<SchemaObject>, 
         Ok(())
     })?;
 
-    let columns_sql = format!(
+    let keep = keep_set(&all_tables, schema_filter).map_err(Abort::Failed)?;
+    if let Some(keep) = &keep {
+        report_phase(format!("表清单 {} 张，过滤后保留 {} 张", all_tables.len(), keep.len()));
+        objects.retain(|object| keep.contains(&object.t));
+        if keep.is_empty() {
+            return Ok(objects);
+        }
+    }
+    // Sorted shards keep every shard's ORDER BY globally ordered, which is
+    // what the index / foreign-key folding below assumes across shards.
+    let shards: Vec<Vec<String>> = match &keep {
+        None => vec![Vec::new()],
+        Some(keep) => {
+            let mut sorted: Vec<String> = keep.iter().cloned().collect();
+            sorted.sort();
+            sorted.chunks(FILTER_CHUNK).map(<[String]>::to_vec).collect()
+        }
+    };
+    let shard_total = shards.len();
+
+    let columns_base = format!(
         "SELECT c.TABLE_NAME AS table_name, c.COLUMN_NAME AS column_name, c.COLUMN_TYPE AS column_type, \
                 c.IS_NULLABLE AS is_nullable, c.COLUMN_DEFAULT AS column_default, c.EXTRA AS extra, \
                 c.CHARACTER_SET_NAME AS charset, c.COLLATION_NAME AS collation, c.ORDINAL_POSITION AS ordinal \
          FROM information_schema.COLUMNS c \
          JOIN information_schema.TABLES tb \
            ON tb.TABLE_SCHEMA = c.TABLE_SCHEMA AND tb.TABLE_NAME = c.TABLE_NAME \
-         WHERE c.TABLE_SCHEMA = {db} AND tb.TABLE_TYPE = 'BASE TABLE' \
-         ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION"
+         WHERE c.TABLE_SCHEMA = {db} AND tb.TABLE_TYPE = 'BASE TABLE'"
     );
-    cli::paginate(connection, &columns_sql, &mut |rows| {
+    let push_columns = |rows: &[Value], objects: &mut Vec<SchemaObject>| -> Result<(), String> {
         for row in rows {
             objects.push(SchemaObject {
                 t: text(row, "table_name"),
@@ -130,18 +202,28 @@ fn collect_mysql(connection: &str, database: &str) -> Result<Vec<SchemaObject>, 
             });
         }
         Ok(())
-    })?;
+    };
+    if keep.is_none() {
+        let columns_sql = format!("{columns_base} ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION");
+        cli::paginate(connection, &columns_sql, is_cancelled, &mut |rows| push_columns(rows, &mut objects))?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取列 {index}/{shard_total}（{} 张表）", shard.len()));
+            let columns_sql =
+                format!("{columns_base} AND c.TABLE_NAME IN ({}) ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION", in_list(shard));
+            cli::paginate(connection, &columns_sql, is_cancelled, &mut |rows| push_columns(rows, &mut objects))?;
+        }
+    }
 
     // One row per index column; folded into a single object per index below.
-    let indexes_sql = format!(
+    let indexes_base = format!(
         "SELECT s.TABLE_NAME AS table_name, s.INDEX_NAME AS index_name, s.NON_UNIQUE AS non_unique, \
                 s.SEQ_IN_INDEX AS seq, s.COLUMN_NAME AS column_name, s.SUB_PART AS sub_part, \
                 s.INDEX_TYPE AS index_type \
          FROM information_schema.STATISTICS s \
          JOIN information_schema.TABLES tb \
            ON tb.TABLE_SCHEMA = s.TABLE_SCHEMA AND tb.TABLE_NAME = s.TABLE_NAME \
-         WHERE s.TABLE_SCHEMA = {db} AND tb.TABLE_TYPE = 'BASE TABLE' \
-         ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX"
+         WHERE s.TABLE_SCHEMA = {db} AND tb.TABLE_TYPE = 'BASE TABLE'"
     );
     let mut pending_index: Option<(String, String, Value, Vec<Value>)> = None;
     let flush_index = |pending: Option<(String, String, Value, Vec<Value>)>, objects: &mut Vec<SchemaObject>| {
@@ -150,41 +232,57 @@ fn collect_mysql(connection: &str, database: &str) -> Result<Vec<SchemaObject>, 
             objects.push(SchemaObject { t: table, o: "index".to_string(), n: name, d: head });
         }
     };
-    cli::paginate(connection, &indexes_sql, &mut |rows| {
-        for row in rows {
-            let table = text(row, "table_name");
-            let name = text(row, "index_name");
-            let column = json!({
-                "name": text(row, "column_name"),
-                "prefix": nullable_text(row, "sub_part"),
-            });
-            match &mut pending_index {
-                Some((pending_table, pending_name, _, columns)) if *pending_table == table && *pending_name == name => {
-                    columns.push(column);
-                }
-                _ => {
-                    flush_index(pending_index.take(), &mut objects);
-                    let head = json!({
-                        "unique": text(row, "non_unique") == "0",
-                        "type": text(row, "index_type"),
-                    });
-                    pending_index = Some((table, name, head, vec![column]));
+    let push_index_rows =
+        |rows: &[Value], pending_index: &mut Option<(String, String, Value, Vec<Value>)>, objects: &mut Vec<SchemaObject>| {
+            for row in rows {
+                let table = text(row, "table_name");
+                let name = text(row, "index_name");
+                let column = json!({
+                    "name": text(row, "column_name"),
+                    "prefix": nullable_text(row, "sub_part"),
+                });
+                match pending_index {
+                    Some((pending_table, pending_name, _, columns)) if *pending_table == table && *pending_name == name => {
+                        columns.push(column);
+                    }
+                    _ => {
+                        flush_index(pending_index.take(), objects);
+                        let head = json!({
+                            "unique": text(row, "non_unique") == "0",
+                            "type": text(row, "index_type"),
+                        });
+                        *pending_index = Some((table, name, head, vec![column]));
+                    }
                 }
             }
+        };
+    if keep.is_none() {
+        let indexes_sql = format!("{indexes_base} ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX");
+        cli::paginate(connection, &indexes_sql, is_cancelled, &mut |rows| {
+            push_index_rows(rows, &mut pending_index, &mut objects);
+            Ok(())
+        })?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取索引 {index}/{shard_total}（{} 张表）", shard.len()));
+            let indexes_sql =
+                format!("{indexes_base} AND s.TABLE_NAME IN ({}) ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX", in_list(shard));
+            cli::paginate(connection, &indexes_sql, is_cancelled, &mut |rows| {
+                push_index_rows(rows, &mut pending_index, &mut objects);
+                Ok(())
+            })?;
         }
-        Ok(())
-    })?;
+    }
     flush_index(pending_index.take(), &mut objects);
 
-    let foreign_keys_sql = format!(
+    let foreign_keys_base = format!(
         "SELECT k.TABLE_NAME AS table_name, k.CONSTRAINT_NAME AS constraint_name, k.COLUMN_NAME AS column_name, \
                 k.REFERENCED_TABLE_NAME AS ref_table, k.REFERENCED_COLUMN_NAME AS ref_column, \
                 r.UPDATE_RULE AS update_rule, r.DELETE_RULE AS delete_rule \
          FROM information_schema.KEY_COLUMN_USAGE k \
          JOIN information_schema.REFERENTIAL_CONSTRAINTS r \
            ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME \
-         WHERE k.TABLE_SCHEMA = {db} AND k.REFERENCED_TABLE_NAME IS NOT NULL \
-         ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION"
+         WHERE k.TABLE_SCHEMA = {db} AND k.REFERENCED_TABLE_NAME IS NOT NULL"
     );
     let mut pending_fk: Option<(String, String, Value, Vec<String>, Vec<String>)> = None;
     let flush_fk = |pending: Option<(String, String, Value, Vec<String>, Vec<String>)>,
@@ -195,34 +293,97 @@ fn collect_mysql(connection: &str, database: &str) -> Result<Vec<SchemaObject>, 
             objects.push(SchemaObject { t: table, o: "foreign_key".to_string(), n: name, d: head });
         }
     };
-    cli::paginate(connection, &foreign_keys_sql, &mut |rows| {
-        for row in rows {
-            let table = text(row, "table_name");
-            let name = text(row, "constraint_name");
-            match &mut pending_fk {
-                Some((pending_table, pending_name, _, columns, referenced))
-                    if *pending_table == table && *pending_name == name =>
-                {
-                    columns.push(text(row, "column_name"));
-                    referenced.push(text(row, "ref_column"));
-                }
-                _ => {
-                    flush_fk(pending_fk.take(), &mut objects);
-                    let head = json!({
-                        "referencedTable": text(row, "ref_table"),
-                        "updateRule": nullable_text(row, "update_rule"),
-                        "deleteRule": nullable_text(row, "delete_rule"),
-                    });
-                    pending_fk = Some((table, name, head, vec![text(row, "column_name")], vec![text(row, "ref_column")]));
+    let push_fk_rows =
+        |rows: &[Value], pending_fk: &mut Option<(String, String, Value, Vec<String>, Vec<String>)>, objects: &mut Vec<SchemaObject>| {
+            for row in rows {
+                let table = text(row, "table_name");
+                let name = text(row, "constraint_name");
+                match pending_fk {
+                    Some((pending_table, pending_name, _, columns, referenced))
+                        if *pending_table == table && *pending_name == name =>
+                    {
+                        columns.push(text(row, "column_name"));
+                        referenced.push(text(row, "ref_column"));
+                    }
+                    _ => {
+                        flush_fk(pending_fk.take(), objects);
+                        let head = json!({
+                            "referencedTable": text(row, "ref_table"),
+                            "updateRule": nullable_text(row, "update_rule"),
+                            "deleteRule": nullable_text(row, "delete_rule"),
+                        });
+                        *pending_fk = Some((table, name, head, vec![text(row, "column_name")], vec![text(row, "ref_column")]));
+                    }
                 }
             }
+        };
+    if keep.is_none() {
+        let foreign_keys_sql =
+            format!("{foreign_keys_base} ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION");
+        cli::paginate(connection, &foreign_keys_sql, is_cancelled, &mut |rows| {
+            push_fk_rows(rows, &mut pending_fk, &mut objects);
+            Ok(())
+        })?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取外键 {index}/{shard_total}（{} 张表）", shard.len()));
+            let foreign_keys_sql = format!(
+                "{foreign_keys_base} AND k.TABLE_NAME IN ({}) ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+                in_list(shard)
+            );
+            cli::paginate(connection, &foreign_keys_sql, is_cancelled, &mut |rows| {
+                push_fk_rows(rows, &mut pending_fk, &mut objects);
+                Ok(())
+            })?;
         }
-        Ok(())
-    })?;
+    }
     flush_fk(pending_fk.take(), &mut objects);
 
     objects.sort_by(|a, b| (&a.t, &a.o, &a.n).cmp(&(&b.t, &b.o, &b.n)));
     Ok(objects)
+}
+
+/// Column types for the data channel's tables, regardless of the schema
+/// filter.
+///
+/// The filtered `collect` above no longer sees excluded tables, but `diff`
+/// still has to render literals for the six data tables with their own types.
+/// This is one tiny query over exactly those tables -- dozens of rows, one
+/// page -- instead of the old "read the whole schema unfiltered" for the same
+/// purpose.
+pub fn collect_data_column_types(
+    connection: &str,
+    database: &str,
+    dialect: Dialect,
+    tables: &[String],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<HashMap<(String, String), String>, Abort> {
+    if tables.is_empty() {
+        return Ok(HashMap::new());
+    }
+    match dialect {
+        Dialect::MySql => {
+            let db = quote_string(database);
+            let mut out = HashMap::new();
+            for shard in tables.chunks(FILTER_CHUNK) {
+                let sql = format!(
+                    "SELECT c.TABLE_NAME AS table_name, c.COLUMN_NAME AS column_name, c.COLUMN_TYPE AS column_type \
+                     FROM information_schema.COLUMNS c \
+                     WHERE c.TABLE_SCHEMA = {db} AND c.TABLE_NAME IN ({}) \
+                     ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION",
+                    in_list(shard)
+                );
+                cli::paginate(connection, &sql, is_cancelled, &mut |rows| {
+                    for row in rows {
+                        out.insert((text(row, "table_name"), text(row, "column_name")), text(row, "column_type"));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(out)
+        }
+        Dialect::Postgres => crate::schema_pg::column_types_for_tables(connection, tables, is_cancelled),
+    }
 }
 
 // ------------------------------------------------------------------ storage
@@ -925,7 +1086,7 @@ pub(crate) fn nullable_text(row: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::widens;
+    use super::{in_list, keep_set, widens};
 
     /// The case that has to land in the auto file: it is the most common type
     /// change there is, and it cannot lose a row.
@@ -977,5 +1138,42 @@ mod tests {
         assert!(!widens("varchar(100)", "geometry"));
         assert!(!widens("varchar(100)", "varchar"));
         assert!(!widens("decimal(10,2)", "decimal(10)"));
+    }
+
+    /// Empty pattern means "keep everything": no `IN` clause at all.
+    #[test]
+    fn empty_filter_means_no_whitelist() {
+        let tables = vec!["a".to_string(), "b".to_string()];
+        assert!(keep_set(&tables, "").unwrap().is_none());
+        assert!(keep_set(&tables, "   ").unwrap().is_none());
+    }
+
+    /// The production shape: a negative-lookahead exclusion. Kept tables must
+    /// match exactly what the old post-filter kept -- the SQL `IN` is built
+    /// from this set, never from a translated regex.
+    #[test]
+    fn exclusion_filter_builds_exact_keep_set() {
+        let tables =
+            vec!["dsfa_rm".to_string(), "test_a".to_string(), "t_tmp".to_string(), "dsfa_mm".to_string()];
+        let keep = keep_set(&tables, "^(?!test_|t_).*$").unwrap().expect("a keep set");
+        assert_eq!(keep, ["dsfa_mm".to_string(), "dsfa_rm".to_string()].into_iter().collect());
+    }
+
+    /// A filter that keeps nothing must short-circuit the detail queries
+    /// rather than emit `IN ()`, which is a syntax error.
+    #[test]
+    fn rejecting_filter_yields_empty_keep_set() {
+        let tables = vec!["a".to_string()];
+        let keep = keep_set(&tables, "^zzz$").unwrap().expect("a keep set");
+        assert!(keep.is_empty());
+    }
+
+    /// `IN` items are string literals, quoted as such -- including a quote in
+    /// a table name, which must not break out of the literal.
+    #[test]
+    fn in_list_quotes_string_literals() {
+        assert_eq!(in_list(&["a".to_string(), "b".to_string()]), "'a', 'b'");
+        assert_eq!(in_list(&["o'b".to_string()]), "'o''b'");
+        assert_eq!(in_list(&[]), "");
     }
 }

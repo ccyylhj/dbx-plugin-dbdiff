@@ -93,6 +93,11 @@ pub fn query_with_cancel(
         match query_once(connection, sql, timeout, is_cancelled) {
             // A cancelled run must not be retried -- the flag is still set.
             Err(error) if error.code != CANCELLED && attempt < RETRIES && is_connection_error(&error) => {
+                // ... and must not sleep out the backoff after the user asked
+                // out either: 2s/4s/6s of dead "cancelling" per retry otherwise.
+                if is_cancelled() {
+                    return Err(CliError::new(CANCELLED, "已取消"));
+                }
                 attempt += 1;
                 thread::sleep(RETRY_BACKOFF * attempt as u32);
             }
@@ -225,13 +230,20 @@ pub fn result_rows(result: &Value) -> Vec<Value> {
 pub fn paginate(
     connection: &str,
     select_sql: &str,
+    is_cancelled: &dyn Fn() -> bool,
     handle_page: &mut dyn FnMut(&[Value]) -> Result<(), String>,
 ) -> Result<u64, CliError> {
     let mut total: u64 = 0;
     let mut page: u64 = 0;
     loop {
+        // Checked per page as well as inside the query: without this, a cancel
+        // arriving between two fast pages still waits out the next slow one,
+        // and a schema collect (all `paginate`) never noticed cancel at all.
+        if is_cancelled() {
+            return Err(CliError::new(CANCELLED, "已取消"));
+        }
         let sql = format!("{select_sql} LIMIT {} OFFSET {}", PAGE_SIZE, page * PAGE_SIZE as u64);
-        let result = query_with_cancel(connection, &sql, PAGE_TIMEOUT, &|| false)
+        let result = query_with_cancel(connection, &sql, PAGE_TIMEOUT, is_cancelled)
             .map_err(|error| CliError::new(error.code, format!("{}\n{sql}", error.message)))?;
         let rows = result_rows(&result);
         let fetched = rows.len();
@@ -779,6 +791,22 @@ pub fn describe_cli() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cancelled pagination must not spawn any query at all: the flag is
+    /// checked before the first page, so this runs with no database and no CLI.
+    /// This is the regression test for "cancel stuck in 取消中 during a schema
+    /// read" -- `paginate` used to hardcode a never-cancelled closure.
+    #[test]
+    fn a_cancelled_paginate_issues_no_query() {
+        let mut pages = 0u32;
+        let outcome = paginate("no-such-connection", "SELECT 1", &|| true, &mut |_| {
+            pages += 1;
+            Ok(())
+        });
+        let error = outcome.expect_err("a cancelled paginate fails");
+        assert_eq!(error.code, CANCELLED);
+        assert_eq!(pages, 0);
+    }
 
     /// A throwaway directory tree. This crate has no dev-dependencies, so it is
     /// built by hand; the name carries the test's own name and the process id so

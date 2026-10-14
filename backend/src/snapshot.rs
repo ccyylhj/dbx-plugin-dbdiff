@@ -297,7 +297,14 @@ pub fn run_snapshot(
     // Whole-database schema, last so the progress bar only reaches 100% when the
     // snapshot is actually complete.
     with_job(|job| job.detail = "读取全库表结构".to_string());
-    let schema_meta = match write_schema(connection, database, dialect, schema_filter, &dir) {
+    let schema_meta = match write_schema(
+        connection,
+        database,
+        dialect,
+        schema_filter,
+        &|| cancel.load(Ordering::Relaxed),
+        &dir,
+    ) {
         Ok(meta) => meta,
         Err(error) => {
             if owns_directory {
@@ -618,9 +625,12 @@ pub fn write_schema(
     database: &str,
     dialect: Dialect,
     schema_filter: &str,
+    is_cancelled: &dyn Fn() -> bool,
     dir: &Path,
 ) -> Result<SchemaMeta, Abort> {
-    let mut objects = schema::collect(connection, database, dialect)?;
+    let mut objects = schema::collect(connection, database, dialect, schema_filter, is_cancelled)?;
+    // No-op when `collect` already pushed the filter down; kept so the stored
+    // file is defined by the regex even if a shard boundary ever misbehaves.
     schema::filter_objects(&mut objects, schema_filter).map_err(Abort::Failed)?;
     let path = dir.join("schema.jsonl");
     schema::write_jsonl(&path, &objects).map_err(Abort::Failed)?;

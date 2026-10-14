@@ -352,13 +352,30 @@ fn collect_and_compare(
         job.detail = "读取当前结构".to_string();
         job.tables_done = 1;
     });
-    // Read unfiltered: the schema filter narrows what the *schema channel*
-    // compares, but the six data tables still need their column types for
-    // literal rendering whether or not the filter keeps them.
-    let live_all = schema::collect(connection, database, dialect)?;
-    let column_types = column_types(&live_all);
-    let mut live_filtered = live_all;
+    // Filtered at the source: `collect` only reads the tables the schema
+    // filter keeps (table list first, details with `IN (...)` shards), instead
+    // of scanning the whole schema and throwing two thirds away. The data
+    // channel's six tables still need their column types for literal rendering
+    // even when the filter excludes them, so those come from one tiny extra
+    // query rather than from an unfiltered full-schema read.
+    let mut live_filtered =
+        schema::collect(connection, database, dialect, &filters.schema_filter, &|| {
+            cancel.load(Ordering::Relaxed)
+        })?;
+    // No-op safety net: defines the stored file by the regex itself.
     schema::filter_objects(&mut live_filtered, &filters.schema_filter).map_err(Abort::Failed)?;
+    let mut column_types = column_types(&live_filtered);
+    let data_tables: Vec<String> = comparisons.iter().map(|comparison| comparison.spec.table.clone()).collect();
+    match schema::collect_data_column_types(connection, database, dialect, &data_tables, &|| {
+        cancel.load(Ordering::Relaxed)
+    }) {
+        Ok(extra) => {
+            for (key, value) in extra {
+                column_types.entry(key).or_insert(value);
+            }
+        }
+        Err(error) => return Err(error),
+    }
     check_cancel(cancel)?;
 
     let schema_diff = schema::diff(&baseline_schema, &live_filtered, dialect);

@@ -11,6 +11,8 @@
 //! the same detail keys), so `schema::diff` -- the part that decides what counts
 //! as a difference -- is written once and works for both.
 
+use std::collections::{BTreeSet, HashMap};
+
 use serde_json::{json, Value};
 
 use crate::cli;
@@ -18,24 +20,97 @@ use crate::encode::quote_string;
 use crate::schema::{is_numeric_type, nullable_text, plain_list, text, SchemaObject};
 use crate::snapshot::Abort;
 
+/// Rows of one `IN (...)` shard; mirrors `schema::FILTER_CHUNK` in spirit.
+/// 500 quoted table names are ~10KB of SQL.
+const FILTER_CHUNK: usize = 500;
+
+fn in_list(names: &[String]) -> String {
+    names.iter().map(|name| quote_string(name)).collect::<Vec<_>>().join(", ")
+}
+
+fn report_phase(detail: String) {
+    crate::snapshot::with_job(|job| job.detail = detail);
+}
+
 /// The schema expression every query below is scoped by. PostgreSQL separates
 /// database from schema, and these project tables live in the schema the
 /// connection resolves unqualified names to.
 const SCHEMA: &str = "current_schema()";
 
-pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
+/// Shared column-read shape: straight off `pg_catalog`, not
+/// `information_schema.columns`. That view is a multi-catalog JOIN with
+/// per-row privilege checks whose predicates do not push down: on a 3000-table
+/// schema even a 500-table `IN` shard recomputes the whole schema per shard
+/// (observed: one shard > 10 min). This resolves the same OIDs the view itself
+/// reads, so every alias carries the same value the old query returned:
+///
+/// - `udt_name` = `pg_type.typname`, lengths from `atttypmod` exactly as the
+///   view decodes them (`varchar`/`bpchar`: `typmod - 4`; `numeric`: high/low
+///   16 bits; timestamp precision: `typmod`, `-1` meaning "unspecified" just
+///   like the view's NULL)
+/// - `column_default` = `pg_get_expr(adbin, adrelid)`, the view's own
+///   expression; the `LEFT JOIN` keeps it NULL (and cheap) for the common
+///   no-default case instead of deparsing per column
+/// - `collation_name` = `pg_collation.collname` off `attcollation`, the view's
+///   own join; non-collatable types have `attcollation = 0` -> NULL
+/// - `is_nullable` / `is_identity` spelled `YES`/`NO` as the view spells them
+/// - `has_table_privilege(..., 'SELECT, ...')` mirrors the view's row
+///   visibility so the table set cannot drift from the table list above
+///
+/// Both the full collect and the data channel's tiny type lookup build on it,
+/// so the two can never decode a type differently.
+fn columns_base_sql() -> String {
+    format!(
+        "SELECT c.relname AS table_name, a.attname AS column_name, t.typname AS udt_name, \
+                CASE WHEN t.typname IN ('varchar', 'bpchar') AND a.atttypmod > 0 \
+                     THEN (a.atttypmod - 4)::text END AS char_len, \
+                CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
+                     THEN (((a.atttypmod - 4) >> 16) & 65535)::text END AS num_precision, \
+                CASE WHEN t.typname = 'numeric' AND a.atttypmod > 0 \
+                     THEN ((a.atttypmod - 4) & 65535)::text END AS num_scale, \
+                CASE WHEN t.typname IN ('timestamp', 'timestamptz', 'time', 'timetz') AND a.atttypmod >= 0 \
+                     THEN a.atttypmod::text END AS dt_precision, \
+                CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END AS is_nullable, \
+                pg_get_expr(d.adbin, d.adrelid) AS column_default, \
+                co.collname AS collation_name, a.attnum::text AS ordinal, \
+                CASE WHEN a.attidentity <> '' THEN 'YES' ELSE 'NO' END AS is_identity \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_type t ON t.oid = a.atttypid \
+         LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         LEFT JOIN pg_collation co ON co.oid = a.attcollation \
+         WHERE n.nspname = {SCHEMA} AND c.relkind IN ('r', 'p') \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+           AND has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')"
+    )
+}
+
+pub fn collect(
+    connection: &str,
+    schema_filter: &str,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<SchemaObject>, Abort> {
     let mut objects = Vec::new();
 
+    // Phase 1: cheap table list. The keep set is computed from it with the
+    // same `fancy_regex` match as the old post-filter, so the result is
+    // identical -- the SQL `IN` below is an exact table-name match, never a
+    // regex translation (PostgreSQL's `~` is POSIX and cannot express
+    // `(?!...)` anyway).
     let tables_sql = format!(
         "SELECT t.table_name AS table_name \
          FROM information_schema.tables t \
          WHERE t.table_schema = {SCHEMA} AND t.table_type = 'BASE TABLE' \
          ORDER BY t.table_name"
     );
-    cli::paginate(connection, &tables_sql, &mut |rows| {
+    let mut all_tables: Vec<String> = Vec::new();
+    cli::paginate(connection, &tables_sql, is_cancelled, &mut |rows| {
         for row in rows {
+            let table = text(row, "table_name");
+            all_tables.push(table.clone());
             objects.push(SchemaObject {
-                t: text(row, "table_name"),
+                t: table,
                 o: "table".to_string(),
                 n: String::new(),
                 // PostgreSQL has neither a table engine nor a table-level
@@ -48,20 +123,41 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
         Ok(())
     })?;
 
-    let columns_sql = format!(
-        "SELECT c.table_name AS table_name, c.column_name AS column_name, c.udt_name AS udt_name, \
-                c.character_maximum_length AS char_len, c.numeric_precision AS num_precision, \
-                c.numeric_scale AS num_scale, c.datetime_precision AS dt_precision, \
-                c.is_nullable AS is_nullable, c.column_default AS column_default, \
-                c.collation_name AS collation_name, c.ordinal_position AS ordinal, \
-                c.is_identity AS is_identity \
-         FROM information_schema.columns c \
-         JOIN information_schema.tables t \
-           ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
-         WHERE c.table_schema = {SCHEMA} AND t.table_type = 'BASE TABLE' \
-         ORDER BY c.table_name, c.ordinal_position"
-    );
-    cli::paginate(connection, &columns_sql, &mut |rows| {
+    let keep: Option<BTreeSet<String>> = match crate::schema::compile_filter(schema_filter) {
+        Ok(None) => None,
+        Ok(Some(regex)) => {
+            let mut keep = BTreeSet::new();
+            for table in &all_tables {
+                if regex.is_match(table).unwrap_or(false) {
+                    keep.insert(table.clone());
+                }
+            }
+            Some(keep)
+        }
+        Err(message) => return Err(Abort::Failed(message)),
+    };
+    if let Some(keep) = &keep {
+        report_phase(format!("表清单 {} 张，过滤后保留 {} 张", all_tables.len(), keep.len()));
+        objects.retain(|object| keep.contains(&object.t));
+        if keep.is_empty() {
+            return Ok(objects);
+        }
+    }
+    // Sorted shards keep every shard's ORDER BY globally ordered, which is
+    // what the foreign-key folding below assumes across shards.
+    let shards: Vec<Vec<String>> = match &keep {
+        None => vec![Vec::new()],
+        Some(keep) => {
+            let mut sorted: Vec<String> = keep.iter().cloned().collect();
+            sorted.sort();
+            sorted.chunks(FILTER_CHUNK).map(<[String]>::to_vec).collect()
+        }
+    };
+    let shard_total = shards.len();
+
+    // Straight off `pg_catalog` -- see `columns_base_sql`.
+    let columns_base = columns_base_sql();
+    let push_columns = |rows: &[Value], objects: &mut Vec<SchemaObject>| -> Result<(), String> {
         for row in rows {
             objects.push(SchemaObject {
                 t: text(row, "table_name"),
@@ -82,12 +178,26 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
             });
         }
         Ok(())
-    })?;
+    };
+    if keep.is_none() {
+        let columns_sql = format!("{columns_base} ORDER BY table_name, ordinal");
+        cli::paginate(connection, &columns_sql, is_cancelled, &mut |rows| push_columns(rows, &mut objects))?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取列 {index}/{shard_total}（{} 张表）", shard.len()));
+            let columns_sql = format!(
+                "{columns_base} AND c.relname IN ({}) ORDER BY table_name, ordinal",
+                in_list(shard)
+            );
+            cli::paginate(connection, &columns_sql, is_cancelled, &mut |rows| push_columns(rows, &mut objects))?;
+        }
+    }
 
     // `pg_index` rather than `information_schema`: the standard view has no
     // index information at all. One row per index, with the key columns already
-    // in key order.
-    let indexes_sql = format!(
+    // in key order. This is the most expensive of the four queries
+    // (`pg_get_expr` per index), and the one the table whitelist saves most on.
+    let indexes_base = format!(
         "SELECT tb.relname AS table_name, ix.relname AS index_name, \
                 i.indisprimary AS is_primary, i.indisunique AS is_unique, am.amname AS method, \
                 (SELECT string_agg(a.attname, ',' ORDER BY k.ord) \
@@ -99,10 +209,9 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
          JOIN pg_class tb ON tb.oid = i.indrelid \
          JOIN pg_am am ON am.oid = ix.relam \
          JOIN pg_namespace n ON n.oid = tb.relnamespace \
-         WHERE n.nspname = {SCHEMA} AND tb.relkind = 'r' \
-         ORDER BY tb.relname, ix.relname"
+         WHERE n.nspname = {SCHEMA} AND tb.relkind = 'r'"
     );
-    cli::paginate(connection, &indexes_sql, &mut |rows| {
+    let push_index_rows = |rows: &[Value], objects: &mut Vec<SchemaObject>| -> Result<(), String> {
         for row in rows {
             let columns: Vec<Value> = text(row, "cols")
                 .split(',')
@@ -126,9 +235,22 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
             });
         }
         Ok(())
-    })?;
+    };
+    if keep.is_none() {
+        let indexes_sql = format!("{indexes_base} ORDER BY tb.relname, ix.relname");
+        cli::paginate(connection, &indexes_sql, is_cancelled, &mut |rows| push_index_rows(rows, &mut objects))?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取索引 {index}/{shard_total}（{} 张表）", shard.len()));
+            let indexes_sql = format!(
+                "{indexes_base} AND tb.relname IN ({}) ORDER BY tb.relname, ix.relname",
+                in_list(shard)
+            );
+            cli::paginate(connection, &indexes_sql, is_cancelled, &mut |rows| push_index_rows(rows, &mut objects))?;
+        }
+    }
 
-    let foreign_keys_sql = format!(
+    let foreign_keys_base = format!(
         "SELECT tc.table_name AS table_name, tc.constraint_name AS constraint_name, \
                 kcu.column_name AS column_name, ccu.table_name AS ref_table, \
                 ccu.column_name AS ref_column, rc.update_rule AS update_rule, \
@@ -140,8 +262,7 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
            ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema \
          LEFT JOIN information_schema.referential_constraints rc \
            ON rc.constraint_name = tc.constraint_name AND rc.constraint_schema = tc.table_schema \
-         WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = {SCHEMA} \
-         ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position"
+         WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = {SCHEMA}"
     );
     let mut pending: Option<(String, String, Value, Vec<String>, Vec<String>)> = None;
     let flush = |pending: Option<(String, String, Value, Vec<String>, Vec<String>)>,
@@ -152,13 +273,13 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
             objects.push(SchemaObject { t: table, o: "foreign_key".to_string(), n: name, d: head });
         }
     };
-    cli::paginate(connection, &foreign_keys_sql, &mut |rows| {
+    let push_fk_page = |rows: &[Value], pending: &mut Option<(String, String, Value, Vec<String>, Vec<String>)>, objects: &mut Vec<SchemaObject>| {
         for row in rows {
             let table = text(row, "table_name");
             let name = text(row, "constraint_name");
             let column = text(row, "column_name");
             let referenced = text(row, "ref_column");
-            match &mut pending {
+            match pending {
                 Some((pending_table, pending_name, _, columns, referenced_columns))
                     if *pending_table == table && *pending_name == name =>
                 {
@@ -166,8 +287,8 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
                     referenced_columns.push(referenced);
                 }
                 _ => {
-                    flush(pending.take(), &mut objects);
-                    pending = Some((
+                    flush(pending.take(), objects);
+                    *pending = Some((
                         table,
                         name,
                         json!({
@@ -181,11 +302,64 @@ pub fn collect(connection: &str) -> Result<Vec<SchemaObject>, Abort> {
                 }
             }
         }
-        Ok(())
-    })?;
+    };
+    if keep.is_none() {
+        let foreign_keys_sql = format!(
+            "{foreign_keys_base} ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position"
+        );
+        cli::paginate(connection, &foreign_keys_sql, is_cancelled, &mut |rows| {
+            push_fk_page(rows, &mut pending, &mut objects);
+            Ok(())
+        })?;
+    } else {
+        for (index, shard) in shards.iter().enumerate() {
+            report_phase(format!("读取外键 {index}/{shard_total}（{} 张表）", shard.len()));
+            let foreign_keys_sql = format!(
+                "{foreign_keys_base} AND tc.table_name IN ({}) ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position",
+                in_list(shard)
+            );
+            cli::paginate(connection, &foreign_keys_sql, is_cancelled, &mut |rows| {
+                push_fk_page(rows, &mut pending, &mut objects);
+                Ok(())
+            })?;
+        }
+    }
     flush(pending.take(), &mut objects);
 
+    objects.sort_by(|a, b| (&a.t, &a.o, &a.n).cmp(&(&b.t, &b.o, &b.n)));
     Ok(objects)
+}
+
+/// Column types for exactly `tables`, regardless of the schema filter.
+///
+/// The filtered `collect` above no longer sees excluded tables, but the data
+/// channel still renders literals for its own tables with their own types.
+/// One tiny query instead of the old "read the whole schema unfiltered".
+pub fn column_types_for_tables(
+    connection: &str,
+    tables: &[String],
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<HashMap<(String, String), String>, Abort> {
+    let mut out = HashMap::new();
+    if tables.is_empty() {
+        return Ok(out);
+    }
+    let mut sorted: Vec<String> = tables.to_vec();
+    sorted.sort();
+    let base = columns_base_sql();
+    for shard in sorted.chunks(FILTER_CHUNK) {
+        let sql = format!(
+            "{base} AND c.relname IN ({}) ORDER BY table_name, ordinal",
+            in_list(shard)
+        );
+        cli::paginate(connection, &sql, is_cancelled, &mut |rows| {
+            for row in rows {
+                out.insert((text(row, "table_name"), text(row, "column_name")), column_type(row));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(out)
 }
 
 /// The column's type, spelled the way it would be written in DDL.
