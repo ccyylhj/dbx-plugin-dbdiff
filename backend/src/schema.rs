@@ -968,7 +968,11 @@ pub(crate) fn is_numeric_type(column_type: &str) -> bool {
 /// (`varchar`, `text`, `longtext`, `datetime`, `decimal`, `int`): there is no
 /// binary or `TIMESTAMP` column among them, so there is no hex form and no
 /// session-time-zone conversion to get wrong.
-pub fn render_value(value: Option<&str>, column_type: &str) -> String {
+///
+/// String escaping is dialect-specific: MySQL interprets backslash escapes
+/// while PostgreSQL (standard_conforming_strings=on) treats them as literal,
+/// so JSON like `dsfa_rm.content` (full of `\"`) must not share one escaper.
+pub fn render_value(dialect: Dialect, value: Option<&str>, column_type: &str) -> String {
     let Some(text) = value else {
         return "NULL".to_string();
     };
@@ -977,7 +981,7 @@ pub fn render_value(value: Option<&str>, column_type: &str) -> String {
     if is_numeric_type(column_type) && !text.is_empty() && text.parse::<f64>().is_ok() {
         return text.to_string();
     }
-    quote_string(text)
+    dialect.quote_string(text)
 }
 
 fn render_default(default: &str, column_type: &str, extra: &str) -> String {
@@ -1086,7 +1090,8 @@ pub(crate) fn nullable_text(row: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_list, keep_set, widens};
+    use super::{in_list, keep_set, render_value, widens};
+    use crate::dialect::Dialect;
 
     /// The case that has to land in the auto file: it is the most common type
     /// change there is, and it cannot lose a row.
@@ -1175,5 +1180,18 @@ mod tests {
         assert_eq!(in_list(&["a".to_string(), "b".to_string()]), "'a', 'b'");
         assert_eq!(in_list(&["o'b".to_string()]), "'o''b'");
         assert_eq!(in_list(&[]), "");
+    }
+
+    /// The `dsfa_rm.content` case: JSON with `\"` must round-trip per dialect.
+    #[test]
+    fn render_value_quotes_per_dialect() {
+        let json = "{\"a\":\"{\\\"x\\\":1}\"}";
+        assert_eq!(
+            render_value(Dialect::MySql, Some(json), "text"),
+            "'{\"a\":\"{\\\\\"x\\\\\":1}\"}'"
+        );
+        assert_eq!(render_value(Dialect::Postgres, Some(json), "text"), format!("'{json}'"));
+        assert_eq!(render_value(Dialect::MySql, None, "text"), "NULL");
+        assert_eq!(render_value(Dialect::Postgres, Some("42"), "integer"), "42");
     }
 }

@@ -16,16 +16,17 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::{json, Value};
 
 use crate::cli;
-use crate::encode::quote_string;
+use crate::encode::quote_string_pg;
 use crate::schema::{is_numeric_type, nullable_text, plain_list, text, SchemaObject};
 use crate::snapshot::Abort;
 
 /// Rows of one `IN (...)` shard; mirrors `schema::FILTER_CHUNK` in spirit.
-/// 500 quoted table names are ~10KB of SQL.
+/// 500 quoted table names are ~10KB of SQL. PostgreSQL quoting: backslashes
+/// are literal under standard_conforming_strings=on.
 const FILTER_CHUNK: usize = 500;
 
 fn in_list(names: &[String]) -> String {
-    names.iter().map(|name| quote_string(name)).collect::<Vec<_>>().join(", ")
+    names.iter().map(|name| quote_string_pg(name)).collect::<Vec<_>>().join(", ")
 }
 
 fn report_phase(detail: String) {
@@ -448,7 +449,7 @@ fn render_default(default: &str, column_type: &str) -> String {
     if is_numeric_type(column_type) && default.trim().parse::<f64>().is_ok() {
         return default.trim().to_string();
     }
-    quote_string(default)
+    quote_string_pg(default.trim())
 }
 
 pub fn create_table(table: &str, live: &std::collections::BTreeMap<(String, String), std::collections::BTreeMap<String, Value>>) -> String {

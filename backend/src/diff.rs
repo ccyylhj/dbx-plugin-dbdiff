@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 
 use crate::config;
 use crate::dialect::{self, Dialect};
-use crate::encode::{self, quote_string};
+use crate::encode::{self};
 use crate::schema::{self, SchemaDiff, SchemaObject};
 use crate::snapshot::{self, Abort, ScannedRow};
 use crate::store::{self, SchemaMeta, SnapshotMeta, TableMeta};
@@ -869,7 +869,7 @@ fn render_precheck(
         );
         out.push_str(&format!(
             "SELECT {} AS table_name, {} AS expected, COUNT(*) AS actual,\n  {} AS verdict\n  FROM {}{}\n",
-            quote_string(&table.table),
+            dialect.quote_string(&table.table),
             expected,
             verdict,
             dialect.quote_ident(&table.table),
@@ -976,7 +976,7 @@ fn render_insert(
             let rendered: Vec<String> = values
                 .iter()
                 .zip(types.iter())
-                .map(|(value, column_type)| schema::render_value(value.as_deref(), column_type))
+                .map(|(value, column_type)| schema::render_value(dialect, value.as_deref(), column_type))
                 .collect();
             out.push_str(&format!(
                 "INSERT INTO {} ({columns}) VALUES ({});\n",
@@ -1096,7 +1096,7 @@ fn key_predicate(
             let rendered: Vec<String> = key
                 .iter()
                 .zip(primary_key_types.iter())
-                .map(|(value, column_type)| schema::render_value(value.as_deref(), column_type))
+                .map(|(value, column_type)| schema::render_value(dialect, value.as_deref(), column_type))
                 .collect();
             format!("({})", rendered.join(", "))
         })

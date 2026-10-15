@@ -85,9 +85,14 @@ pub fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-/// `'text'`. Escaping is by the standard rules: `sql_mode` is enforced to be
-/// identical across environments at the project level, so there is no
-/// `NO_BACKSLASH_ESCAPES` variant to handle (PLAN.md §8).
+/// `'text'` for MySQL. Escaping is by the standard rules: `sql_mode` is
+/// enforced to be identical across environments at the project level, so there
+/// is no `NO_BACKSLASH_ESCAPES` variant to handle (PLAN.md §8).
+///
+/// MySQL-only. For PostgreSQL use [`quote_string_pg`]: with
+/// `standard_conforming_strings=on` (the default since 9.1) backslashes are
+/// literal, so doubling them corrupts values like the `\"` sequences inside
+/// `dsfa_rm.content` JSON.
 pub fn quote_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -105,8 +110,57 @@ pub fn quote_string(value: &str) -> String {
     out
 }
 
+/// `'text'` for PostgreSQL with `standard_conforming_strings=on`.
+///
+/// Backslashes, newlines and carriage returns are literal there -- emitting
+/// MySQL escapes (`\\`, `\n`) would write extra characters into the value.
+/// The only escaping is `'` -> `''`. A NUL byte cannot be stored in a
+/// PostgreSQL `text` value at all, so it is passed through rather than
+/// mistranslated.
+pub fn quote_string_pg(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for character in value.chars() {
+        match character {
+            '\'' => out.push_str("''"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Deduplicate while preserving the first occurrence's position.
 pub fn dedup(names: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     names.iter().filter(|name| seen.insert((*name).clone())).cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quote_string, quote_string_pg};
+
+    /// `dsfa_rm.content` is JSON full of `\"`: backslash + double-quote.
+    /// MySQL interprets backslash escapes, so the backslash must be doubled.
+    #[test]
+    fn mysql_doubles_backslashes_in_json() {
+        assert_eq!(quote_string("\\\""), "'\\\\\"'");
+        assert_eq!(quote_string("a\nb"), "'a\\nb'");
+        assert_eq!(quote_string("o'b"), "'o''b'");
+    }
+
+    /// Same input on PostgreSQL (standard_conforming_strings=on): backslashes
+    /// are literal, so doubling them would write an extra backslash per `\"`.
+    #[test]
+    fn postgres_keeps_backslashes_literal() {
+        assert_eq!(quote_string_pg("\\\""), "'\\\"'");
+        assert_eq!(quote_string_pg("a\nb"), "'a\nb'");
+        assert_eq!(quote_string_pg("o'b"), "'o''b'");
+        // The production shape: inner JSON + '' default inside content.
+        let value = "{\"content\":\"{\\\"x\\\":1}\",\"defaultValue\":\"''\"}";
+        assert_eq!(
+            quote_string_pg(value),
+            "'{\"content\":\"{\\\"x\\\":1}\",\"defaultValue\":\"''''\"}'"
+        );
+    }
 }

@@ -76,6 +76,19 @@ impl Dialect {
         names.iter().map(|name| self.quote_ident(name)).collect::<Vec<_>>().join(", ")
     }
 
+    /// Quote a string literal for a statement that runs on this server.
+    ///
+    /// MySQL interprets backslash escapes (`\\`, `\n`, ...), PostgreSQL with
+    /// `standard_conforming_strings=on` treats backslashes as literal -- so a
+    /// single shared escaper corrupts JSON like `dsfa_rm.content` (full of
+    /// `\"`) on one of the two families. This is the one place that picks.
+    pub fn quote_string(&self, value: &str) -> String {
+        match self {
+            Dialect::MySql => encode::quote_string(value),
+            Dialect::Postgres => encode::quote_string_pg(value),
+        }
+    }
+
     /// One row with the current database, so `resolve_database` has something to
     /// fall back on when the caller does not name one.
     pub fn current_database_sql(&self) -> &'static str {
