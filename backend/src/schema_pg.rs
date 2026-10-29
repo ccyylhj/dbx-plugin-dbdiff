@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::cli;
 use crate::encode::quote_string_pg;
-use crate::schema::{is_numeric_type, nullable_text, plain_list, text, SchemaObject};
+use crate::schema::{nullable_text, plain_list, text, SchemaObject};
 use crate::snapshot::Abort;
 
 /// Rows of one `IN (...)` shard; mirrors `schema::FILTER_CHUNK` in spirit.
@@ -424,7 +424,7 @@ pub fn column_definition(name: &str, detail: &Value) -> String {
     let mut out = format!("{} {}", quote_ident(name), column_type);
 
     if let Some(default) = detail.get("default").and_then(Value::as_str) {
-        out.push_str(&format!(" DEFAULT {}", render_default(default, column_type)));
+        out.push_str(&format!(" DEFAULT {}", render_default(default)));
     }
     if !nullable {
         out.push_str(" NOT NULL");
@@ -432,24 +432,22 @@ pub fn column_definition(name: &str, detail: &Value) -> String {
     out
 }
 
-/// PostgreSQL normalizes a default to an expression (`'x'::character varying`),
-/// so most of them go out as written. The two that must not be quoted are the
-/// ones that are already expressions -- `now()`, `nextval(...)`, a cast.
-fn render_default(default: &str, column_type: &str) -> String {
-    let lowered = default.trim().to_ascii_lowercase();
-    if lowered.contains("::")
-        || lowered.ends_with("()")
-        || lowered.starts_with("nextval")
-        || lowered == "true"
-        || lowered == "false"
-        || lowered == "null"
-    {
-        return default.trim().to_string();
-    }
-    if is_numeric_type(column_type) && default.trim().parse::<f64>().is_ok() {
-        return default.trim().to_string();
-    }
-    quote_string_pg(default.trim())
+/// A default goes out **exactly as the catalogue spells it**, because what the
+/// catalogue hands back is always a SQL *expression*, never a bare value:
+///
+/// - a string literal carries its own cast -- `'0'::character varying`
+/// - a number is bare digits -- `0`
+/// - a function keeps its call -- `nextval('s'::regclass)`, `now()`
+/// - a keyword stays a keyword -- `CURRENT_TIMESTAMP`
+///
+/// `column_default` comes from `pg_get_expr` (see `columns_base_sql`), which is
+/// a deparse for exactly this purpose: the text is re-executable as written.
+/// Quoting it was a bug with a loud symptom: `DEFAULT CURRENT_TIMESTAMP` on
+/// `ds_create_time` came out as the *string* `'CURRENT_TIMESTAMP'`, which is not
+/// a timestamp at all -- every insert into the created table would fail (or
+/// silently store garbage, on a server lenient enough to accept it).
+fn render_default(default: &str) -> String {
+    default.trim().to_string()
 }
 
 pub fn create_table(table: &str, live: &std::collections::BTreeMap<(String, String), std::collections::BTreeMap<String, Value>>) -> String {
@@ -515,7 +513,7 @@ pub fn change_column_statement(table: &str, name: &str, detail: &Value) -> Strin
             ";\nALTER TABLE {} ALTER COLUMN {} SET DEFAULT {}",
             quote_ident(table),
             quote_ident(name),
-            render_default(default, column_type)
+            render_default(default)
         ));
     }
     if detail.get("nullable").and_then(Value::as_bool).unwrap_or(true) {
@@ -650,3 +648,58 @@ fn parse_type(raw: &str) -> Option<PgType> {
 
 /// Integer types, narrowest first.
 const INTEGER_FAMILY: &[&str] = &["smallint", "integer", "bigint"];
+
+#[cfg(test)]
+mod tests {
+    use super::{column_definition, render_default};
+    use serde_json::json;
+
+    /// The production bug: `pg_get_expr` deparses `DEFAULT CURRENT_TIMESTAMP`
+    /// to the bare keyword, and quoting it produced the string
+    /// `'CURRENT_TIMESTAMP'` -- not a timestamp, so nothing could be inserted.
+    #[test]
+    fn a_keyword_default_stays_a_keyword() {
+        assert_eq!(render_default("CURRENT_TIMESTAMP"), "CURRENT_TIMESTAMP");
+        assert_eq!(render_default(" now() "), "now()");
+        assert_eq!(render_default("CURRENT_DATE"), "CURRENT_DATE");
+    }
+
+    /// Everything else the catalogue deparses goes out as written too -- the
+    /// cast is part of the literal, and a number is already bare.
+    #[test]
+    fn expression_defaults_are_emitted_verbatim() {
+        assert_eq!(render_default("'0'::varchar"), "'0'::varchar");
+        assert_eq!(render_default("0"), "0");
+        assert_eq!(render_default("nextval('t_id_seq'::regclass)"), "nextval('t_id_seq'::regclass)");
+        assert_eq!(render_default("true"), "true");
+    }
+
+    /// End to end through the column definition, with the shape that was
+    /// reported: `timestamp DEFAULT 'CURRENT_TIMESTAMP'`.
+    #[test]
+    fn a_timestamp_column_keeps_its_default_expression() {
+        let detail = json!({
+            "columnType": "timestamp",
+            "nullable": true,
+            "default": "CURRENT_TIMESTAMP",
+        });
+        let definition = column_definition("ds_create_time", &detail);
+        assert_eq!(definition, "\"ds_create_time\" timestamp DEFAULT CURRENT_TIMESTAMP");
+        assert!(!definition.contains("'CURRENT_TIMESTAMP'"), "{definition}");
+    }
+
+    /// A string default keeps the cast the catalogue gave it, so it still reads
+    /// back as the same literal.
+    #[test]
+    fn a_literal_default_keeps_its_cast() {
+        let detail = json!({
+            "columnType": "varchar(20)",
+            "nullable": true,
+            "default": "'PENDING'::varchar",
+        });
+        assert_eq!(
+            column_definition("status", &detail),
+            "\"status\" varchar(20) DEFAULT 'PENDING'::varchar"
+        );
+    }
+}
